@@ -1,2 +1,3 @@
 playwright
 httpx
+g4f[all]
