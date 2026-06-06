@@ -1,5 +1,7 @@
 gptpp/__pycache__/
 
+gptpp/chatgpt_session
+
 gptpp/profile/
 
-gptpp/session.json
+gptpp/cookies.json
