@@ -1,2 +1,2 @@
-# ChatGPT4Free
-ChatGPTFree API (with streaming and more features)
+# GLM4Free
+GLM4Free API (with streaming and more features)
