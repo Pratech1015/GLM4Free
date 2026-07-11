@@ -1,36 +1,52 @@
 #!/usr/bin/env python3
 """
 Z.ai Browser Automation Client
-Uses Playwright to intercept API responses and interact with Z.ai
+
+Library usage:
+    from client import ZaiClient
+
+    client = ZaiClient()
+    client.start()
+    client.wait_for_auth()
+
+    # One-shot
+    response = client.send_message("Hello!")
+
+    # Streaming
+    for chunk in client.send_message_stream("Tell me a story"):
+        print(chunk, end="", flush=True)
+
+    client.close()
+
+Interactive mode:
+    python client.py
 """
 
 import time
 import random
-from typing import Optional, List
+from typing import Optional, List, Generator
 from dataclasses import dataclass
 from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext
 
 
 @dataclass
 class ChatMessage:
-    role: str  # 'user' or 'assistant'
+    role: str
     content: str
 
 
 class ZaiClient:
-    def __init__(self, headless: bool = False):
+    def __init__(self, headless: bool = True):
         self.headless = headless
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
-        self.messages: List[ChatMessage] = []
         self._playwright = None
-        
+
     def start(self) -> None:
-        """Initialize browser and navigate to Z.ai"""
         self.close()
         self._playwright = sync_playwright().start()
-        
+
         self.browser = self._playwright.firefox.launch(
             headless=self.headless,
             firefox_user_prefs={
@@ -56,7 +72,7 @@ class ZaiClient:
                 "webgl.enable-webgl2": True,
             }
         )
-        
+
         self.context = self.browser.new_context(
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
@@ -77,14 +93,9 @@ class ZaiClient:
                 "Upgrade-Insecure-Requests": "1",
             }
         )
-        
+
         self.context.add_init_script("""
-            // Override navigator properties to remove automation flags
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-            
-            // Mock plugins
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', {
                 get: () => [
                     { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
@@ -94,398 +105,258 @@ class ZaiClient:
                     { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
                 ]
             });
-            
-            // Mock languages
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-US', 'en']
-            });
-            
-            // Mock platform
-            Object.defineProperty(navigator, 'platform', {
-                get: () => 'Linux x86_64'
-            });
-            
-            // Mock hardware concurrency
-            Object.defineProperty(navigator, 'hardwareConcurrency', {
-                get: () => 8
-            });
-            
-            // Mock device memory
-            Object.defineProperty(navigator, 'deviceMemory', {
-                get: () => 8
-            });
-            
-            // Mock maxTouchPoints
-            Object.defineProperty(navigator, 'maxTouchPoints', {
-                get: () => 0
-            });
-            
-            // Fix chrome object
-            window.chrome = {
-                runtime: {},
-                loadTimes: function() {},
-                csi: function() {},
-                app: {},
-            };
-            
-            // Fix permissions
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) =>
-                parameters.name === 'notifications'
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'platform', { get: () => 'Linux x86_64' });
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+            Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+            window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+            const _origQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (p) =>
+                p.name === 'notifications'
                     ? Promise.resolve({ state: Notification.permission })
-                    : originalQuery(parameters);
-            
-            // Remove automation-related properties
+                    : _origQuery(p);
             delete navigator.__proto__.webdriver;
-            
+
             // === SSE Stream Interceptor ===
-            // Monkey-patch fetch to intercept /api/v2/chat/completions SSE streams
             const _origFetch = window.fetch;
             window.fetch = async function(...args) {
                 const resp = await _origFetch.apply(this, args);
                 const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
-                
+
                 if (url.includes('/api/v2/chat/completions')) {
-                    const contentType = resp.headers.get('content-type') || '';
-                    if (contentType.includes('text/event-stream')) {
+                    const ct = resp.headers.get('content-type') || '';
+                    if (ct.includes('text/event-stream')) {
                         const reader = resp.body.getReader();
                         const decoder = new TextDecoder();
                         let buffer = '';
                         let thinking = '';
                         let answer = '';
-                        
-                        window.__zai_sse = { thinking: '', answer: '', done: false, buffer: '' };
-                        
+                        window.__zai_sse = { thinking: '', answer: '', done: false };
+
                         const stream = new ReadableStream({
                             start(controller) {
-                                function pump() {
+                                (function pump() {
                                     reader.read().then(({ done, value }) => {
-                                        if (done) {
-                                            window.__zai_sse.done = true;
-                                            controller.close();
-                                            return;
-                                        }
+                                        if (done) { window.__zai_sse.done = true; controller.close(); return; }
                                         buffer += decoder.decode(value, { stream: true });
-                                        window.__zai_sse.buffer = buffer;
-                                        
-                                        // Parse SSE lines
                                         const lines = buffer.split('\\n');
-                                        buffer = lines.pop(); // keep incomplete line
-                                        
+                                        buffer = lines.pop();
                                         for (const line of lines) {
                                             if (!line.startsWith('data: ')) continue;
-                                            const jsonStr = line.slice(6).trim();
-                                            if (!jsonStr || jsonStr === '[DONE]') continue;
+                                            const j = line.slice(6).trim();
+                                            if (!j || j === '[DONE]') continue;
                                             try {
-                                                const obj = JSON.parse(jsonStr);
-                                                if (obj.type === 'chat:completion' && obj.data) {
-                                                    const delta = obj.data.delta_content || '';
-                                                    const phase = obj.data.phase || '';
-                                                    if (phase === 'thinking') {
-                                                        thinking += delta;
-                                                        window.__zai_sse.thinking = thinking;
-                                                    } else {
-                                                        answer += delta;
-                                                        window.__zai_sse.answer = answer;
-                                                    }
+                                                const o = JSON.parse(j);
+                                                if (o.type === 'chat:completion' && o.data) {
+                                                    const d = o.data.delta_content || '';
+                                                    if (o.data.phase === 'thinking') { thinking += d; window.__zai_sse.thinking = thinking; }
+                                                    else { answer += d; window.__zai_sse.answer = answer; }
                                                 }
                                             } catch(e) {}
                                         }
-                                        
                                         controller.enqueue(value);
                                         pump();
-                                    }).catch(err => {
-                                        window.__zai_sse.done = true;
-                                        controller.error(err);
-                                    });
-                                }
-                                pump();
+                                    }).catch(() => { window.__zai_sse.done = true; controller.close(); });
+                                })();
                             }
                         });
-                        
-                        return new Response(stream, {
-                            status: resp.status,
-                            statusText: resp.statusText,
-                            headers: resp.headers
-                        });
+                        return new Response(stream, { status: resp.status, statusText: resp.statusText, headers: resp.headers });
                     }
                 }
                 return resp;
             };
         """)
-        
+
         self.page = self.context.new_page()
-        
-        print("=" * 60)
-        print("Loading Z.ai...")
-        print("=" * 60)
-        
         self.page.goto("https://chat.z.ai", wait_until="domcontentloaded", timeout=60000)
-        
-        # Wait for React app to mount
         self.page.wait_for_selector("#app", state="attached", timeout=60000)
         self.page.wait_for_timeout(5000)
-        
-        print("[Ready] Page loaded")
-        
-    def wait_for_auth(self) -> Optional[str]:
-        """Wait for user to complete authentication"""
-        print("\n" + "=" * 60)
-        print("AUTHENTICATION REQUIRED")
-        print("=" * 60)
-        print("1. Complete any captcha if shown")
-        print("2. Login if required (or continue as guest)")
-        print("3. Wait until you see the chat interface")
-        print("4. Press ENTER to continue")
-        print("=" * 60)
-        
-        input("Press ENTER when ready...")
-        
-        # Check for token
-        token = self.page.evaluate("localStorage.getItem('token')")
-        if token:
-            print(f"[Auth] Logged in with token: {token[:50]}...")
-            return token
-        else:
-            print("[Auth] Using guest mode (no token)")
-            return None
-            
-    def _find_element(self, selectors: List[str], timeout: int = 5000):
-        """Try multiple selectors to find an element"""
-        for selector in selectors:
-            try:
-                el = self.page.wait_for_selector(selector, timeout=timeout // len(selectors))
-                if el and el.is_visible():
-                    return el
-            except:
-                continue
-        return None
 
-    def send_message(self, message: str, wait_for_response: bool = True) -> Optional[str]:
+    def wait_for_auth(self) -> Optional[str]:
+        """Wait for user to complete authentication (interactive)"""
+        input("Complete captcha/login, then press ENTER...")
+        token = self.page.evaluate("localStorage.getItem('token')")
+        return token
+
+    def _reset_sse(self) -> None:
+        self.page.evaluate("window.__zai_sse = { thinking: '', answer: '', done: false }")
+
+    def _type_and_send(self, message: str) -> None:
+        textarea = self._find_element([
+            '#chat-input', 'textarea[id="chat-input"]', 'textarea',
+            'textarea[placeholder]', 'div textarea', '[contenteditable="true"]'
+        ])
+        if not textarea:
+            raise RuntimeError("Could not find message input textarea")
+
+        textarea.click()
+        self.page.wait_for_timeout(200 + (hash(message) % 300))
+        for char in message:
+            textarea.type(char, delay=50 + (hash(char) % 80))
+        self.page.wait_for_timeout(300 + (hash(message) % 200))
+
+        send_btn = self.page.query_selector('#send-message-button')
+        if send_btn:
+            self.page.evaluate("() => { const b = document.querySelector('#send-message-button'); if(b) b.disabled=false; }")
+            self._human_delay(150, 400)
+            self._random_mouse_move()
+            try:
+                send_btn.click()
+                return
+            except Exception:
+                pass
+
+        container = self.page.query_selector('[aria-label="Send Message"]')
+        if container:
+            try:
+                container.click()
+                return
+            except Exception:
+                pass
+
+        textarea.press("Enter")
+
+    def _poll_sse(self, timeout: int = 120) -> dict:
+        """Poll until SSE done, return {thinking, answer}"""
+        start = time.time()
+        while time.time() - start < timeout:
+            sse = self.page.evaluate("window.__zai_sse || {}")
+            if sse.get('done'):
+                return sse
+            time.sleep(0.3)
+        return self.page.evaluate("window.__zai_sse || {}")
+
+    def send_message(self, message: str, timeout: int = 120) -> str:
         """
-        Send a message and extract response from SSE stream
-        
-        Args:
-            message: The message text to send
-            wait_for_response: Whether to wait for and extract the response
-            
+        Send a message and return the full response text.
+
         Returns:
-            The AI's response text, or None if extraction failed
+            The assistant's response as a string.
         """
         if not self.page:
             raise RuntimeError("Client not started. Call start() first.")
-            
-        print(f"\n[User] {message}")
-        
-        # Reset SSE state
-        self.page.evaluate("window.__zai_sse = { thinking: '', answer: '', done: false, buffer: '' }")
-        
-        # Step 1: Find and focus the textarea
-        textarea = self._find_element([
-            '#chat-input',
-            'textarea[id="chat-input"]',
-            'textarea',
-            'textarea[placeholder]',
-            'div textarea',
-            '[contenteditable="true"]'
-        ])
-        
-        if not textarea:
-            self._save_debug_screenshot("no_textarea")
-            raise RuntimeError("Could not find message input textarea")
-            
-        # Step 2: Click to focus, then type with human-like delays
-        textarea.click()
-        self.page.wait_for_timeout(200 + (hash(message) % 300))
-        
-        # Type character by character with random delays
-        for char in message:
-            textarea.type(char, delay=50 + (hash(char) % 80))
-        
-        # Small delay for React state update
-        self.page.wait_for_timeout(300 + (hash(message) % 200))
-        
-        # Step 3: Find and click the send button
-        send_clicked = False
-        
-        # Try the button by ID first
-        send_btn = self.page.query_selector('#send-message-button')
-        if send_btn:
-            self.page.evaluate("""
-                () => {
-                    const btn = document.querySelector('#send-message-button');
-                    if (btn) btn.disabled = false;
-                }
-            """)
-            self._human_delay(150, 400)
-            self._random_mouse_move()
-            
-            try:
-                send_btn.click()
-                send_clicked = True
-                print("[Action] Clicked send button")
-            except Exception as e:
-                print(f"[Warning] Button click failed: {e}")
-                
-        if not send_clicked:
-            container = self.page.query_selector('[aria-label="Send Message"]')
-            if container:
-                try:
-                    container.click()
-                    send_clicked = True
-                    print("[Action] Clicked send container")
-                except Exception as e:
-                    print(f"[Warning] Container click failed: {e}")
-                    
-        if not send_clicked:
-            textarea.press("Enter")
-            print("[Action] Pressed Enter to send")
-            
-        if not wait_for_response:
-            return None
-            
-        # Step 4: Wait for SSE stream to complete and extract response
-        print("[Waiting] For AI response...")
-        return self._wait_for_sse_response()
-        
-    def _wait_for_sse_response(self, timeout: int = 120) -> Optional[str]:
-        """Wait for SSE stream to finish, streaming output to console"""
-        start_time = time.time()
-        last_len = 0
-        in_thinking = False
-        thinking_printed = False
-        thinking_len = 0
+        self._reset_sse()
+        self._type_and_send(message)
+        sse = self._poll_sse(timeout)
+        answer = sse.get('answer', '')
+        if answer:
+            return answer
+        # Fallback to DOM
+        return self._extract_last_assistant_message_from_dom()
+
+    def send_message_stream(self, message: str, timeout: int = 120) -> Generator[str, None, None]:
+        """
+        Send a message and yield response chunks as they arrive.
+
+        Yields:
+            str chunks of the assistant's response.
+        """
+        if not self.page:
+            raise RuntimeError("Client not started. Call start() first.")
+        self._reset_sse()
+        self._type_and_send(message)
+
         answer_len = 0
-        
-        while time.time() - start_time < timeout:
-            try:
-                sse = self.page.evaluate("window.__zai_sse || {}")
-                done = sse.get('done', False)
-                thinking = sse.get('thinking', '')
-                answer = sse.get('answer', '')
-                
-                # Stream thinking phase
-                if thinking and not thinking_printed:
-                    if not in_thinking:
-                        in_thinking = True
-                        print("\n[Thinking]", flush=True)
-                    if len(thinking) > thinking_len:
-                        new_text = thinking[thinking_len:]
-                        print(new_text, end="", flush=True)
-                        thinking_len = len(thinking)
-                
-                # Stream answer phase
-                if answer:
-                    if in_thinking and not thinking_printed:
-                        print("\n\n[Response]", end="", flush=True)
-                        thinking_printed = True
-                        in_thinking = False
-                    if len(answer) > answer_len:
-                        new_text = answer[answer_len:]
-                        print(new_text, end="", flush=True)
-                        answer_len = len(answer)
-                
-                # Done
-                if done:
-                    if in_thinking and not thinking_printed:
-                        # Was thinking only, no answer
-                        print()
-                        thinking_printed = True
-                    if not answer and not thinking:
-                        # SSE not intercepted, try DOM
-                        dom_text = self._extract_last_assistant_message_from_dom()
-                        if dom_text:
-                            print(dom_text)
-                            return dom_text
-                    elif answer:
-                        print()  # final newline
-                        result = ""
-                        if thinking:
-                            result += f"[Thinking]\n{thinking}\n\n[Response]\n{answer}"
-                        else:
-                            result = answer
-                        return result
-                    elif thinking:
-                        print()
-                        return f"[Thinking]\n{thinking}"
-                    break
-                    
-            except Exception as e:
-                print(f"\n[Debug] SSE poll error: {e}")
-            time.sleep(0.3)
-            
-        print("\n[Error] Response timeout")
-        return None
-        
-    def _extract_last_assistant_message_from_dom(self) -> str:
-        """Fallback: extract from DOM with style tag stripping"""
-        try:
-            return self.page.evaluate("""
-                () => {
-                    function cleanNode(el) {
-                        const clone = el.cloneNode(true);
-                        clone.querySelectorAll('style, script, noscript, svg').forEach(s => s.remove());
-                        clone.querySelectorAll('.thinking-chain-container, .thinking-block').forEach(tb => tb.remove());
-                        return (clone.innerText || '').trim();
-                    }
-                    const blocks = document.querySelectorAll('.chat-assistant .markdown-prose');
-                    if (blocks.length > 0) {
-                        return cleanNode(blocks[blocks.length - 1]);
-                    }
-                    return '';
-                }
-            """)
-        except Exception:
-            return ""
-        
+        start = time.time()
+        while time.time() - start < timeout:
+            sse = self.page.evaluate("window.__zai_sse || {}")
+            answer = sse.get('answer', '')
+            done = sse.get('done', False)
+
+            if len(answer) > answer_len:
+                yield answer[answer_len:]
+                answer_len = len(answer)
+
+            if done:
+                return
+
+            time.sleep(0.15)
+
+        # Timeout fallback
+        if answer_len == 0:
+            dom = self._extract_last_assistant_message_from_dom()
+            if dom:
+                yield dom
+
+    def send_message_full(self, message: str, timeout: int = 120) -> dict:
+        """
+        Send a message and return both thinking and response.
+
+        Returns:
+            {"thinking": str, "response": str}
+        """
+        if not self.page:
+            raise RuntimeError("Client not started. Call start() first.")
+        self._reset_sse()
+        self._type_and_send(message)
+        sse = self._poll_sse(timeout)
+        return {
+            "thinking": sse.get('thinking', ''),
+            "response": sse.get('answer', ''),
+        }
+
     def get_chat_history(self) -> List[ChatMessage]:
-        """Get full chat history - attempts DOM extraction"""
         try:
             result = self.page.evaluate("""
                 () => {
-                    const messages = [];
-                    function cleanNode(el) {
-                        const clone = el.cloneNode(true);
-                        clone.querySelectorAll('style, script, noscript, svg').forEach(s => s.remove());
-                        clone.querySelectorAll('.thinking-chain-container, .thinking-block').forEach(tb => tb.remove());
-                        return (clone.innerText || '').trim();
+                    const msgs = [];
+                    function clean(el) {
+                        const c = el.cloneNode(true);
+                        c.querySelectorAll('style, script, noscript, svg').forEach(s => s.remove());
+                        c.querySelectorAll('.thinking-chain-container, .thinking-block').forEach(t => t.remove());
+                        return (c.innerText || '').trim();
                     }
-                    
                     document.querySelectorAll('.chat-user .markdown-prose').forEach(el => {
-                        const text = cleanNode(el);
-                        if (text.length > 0) messages.push({role: 'user', content: text});
+                        const t = clean(el);
+                        if (t) msgs.push({role:'user', content:t});
                     });
                     document.querySelectorAll('.chat-assistant .markdown-prose').forEach(el => {
-                        const text = cleanNode(el);
-                        if (text.length > 0) messages.push({role: 'assistant', content: text});
+                        const t = clean(el);
+                        if (t) msgs.push({role:'assistant', content:t});
                     });
-                    return messages;
+                    return msgs;
                 }
             """)
             return [ChatMessage(m['role'], m['content']) for m in result]
         except Exception:
             return []
-        
+
+    def _find_element(self, selectors: List[str], timeout: int = 5000):
+        for sel in selectors:
+            try:
+                el = self.page.wait_for_selector(sel, timeout=timeout // len(selectors))
+                if el and el.is_visible():
+                    return el
+            except Exception:
+                continue
+        return None
+
+    def _extract_last_assistant_message_from_dom(self) -> str:
+        try:
+            return self.page.evaluate("""
+                () => {
+                    function clean(el) {
+                        const c = el.cloneNode(true);
+                        c.querySelectorAll('style, script, noscript, svg').forEach(s => s.remove());
+                        c.querySelectorAll('.thinking-chain-container, .thinking-block').forEach(t => t.remove());
+                        return (c.innerText || '').trim();
+                    }
+                    const b = document.querySelectorAll('.chat-assistant .markdown-prose');
+                    return b.length ? clean(b[b.length-1]) : '';
+                }
+            """)
+        except Exception:
+            return ""
+
     def _random_mouse_move(self):
-        """Simulate random mouse movement"""
-        x = random.randint(100, 1800)
-        y = random.randint(100, 900)
-        self.page.mouse.move(x, y)
+        self.page.mouse.move(random.randint(100, 1800), random.randint(100, 900))
         self.page.wait_for_timeout(50 + random.randint(0, 100))
-        
+
     def _human_delay(self, min_ms: int = 100, max_ms: int = 500):
-        """Add random human-like delay"""
         self.page.wait_for_timeout(random.randint(min_ms, max_ms))
-        
-    def _save_debug_screenshot(self, name: str):
-        """Save screenshot for debugging"""
-        if self.page:
-            filename = f"debug_{name}_{int(time.time())}.png"
-            self.page.screenshot(path=filename)
-            print(f"[Debug] Screenshot saved: {filename}")
-            
+
     def close(self):
-        """Clean up and close browser"""
         if self.browser:
             self.browser.close()
             self.browser = None
@@ -494,28 +365,30 @@ class ZaiClient:
         if self._playwright:
             self._playwright.stop()
             self._playwright = None
-        print("\n[Closed] Browser session ended")
-            
+
     def __enter__(self):
         self.start()
         return self
-        
-    def __exit__(self, exc_type, exc_val, exc_tb):
+
+    def __exit__(self, *args):
+        self.close()
+
+    def __del__(self):
         self.close()
 
 
 def main():
     """Interactive chat with Z.ai"""
     client = ZaiClient(headless=True)
-    
+
     try:
         client.start()
         client.wait_for_auth()
-        
+
         print("\n" + "=" * 60)
         print("CHAT STARTED - Type 'quit' to exit")
         print("=" * 60)
-        
+
         while True:
             try:
                 user_input = input("\nYou: ").strip()
@@ -523,18 +396,17 @@ def main():
                     continue
                 if user_input.lower() in ('quit', 'exit', 'q'):
                     break
-                    
-                response = client.send_message(user_input)
-                
-                if not response:
-                    print("\n[Error] No response received")
-                    
+
+                for chunk in client.send_message_stream(user_input):
+                    print(chunk, end="", flush=True)
+                print()
+
             except KeyboardInterrupt:
                 print("\n\nGoodbye!")
                 break
             except Exception as e:
                 print(f"\n[Error] {e}")
-                
+
     finally:
         client.close()
 
