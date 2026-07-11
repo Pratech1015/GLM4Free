@@ -1,27 +1,3 @@
-#!/usr/bin/env python3
-"""
-Z.ai Browser Automation Client
-
-Library usage:
-    from client import ZaiClient
-
-    client = ZaiClient()
-    client.start()
-    client.wait_for_auth()
-
-    # One-shot
-    response = client.send_message("Hello!")
-
-    # Streaming
-    for chunk in client.send_message_stream("Tell me a story"):
-        print(chunk, end="", flush=True)
-
-    client.close()
-
-Interactive mode:
-    python client.py
-"""
-
 import time
 import random
 from typing import Optional, List, Generator
@@ -190,10 +166,26 @@ class ZaiClient:
         if not textarea:
             raise RuntimeError("Could not find message input textarea")
 
-        textarea.click()
-        self.page.wait_for_timeout(200 + (hash(message) % 300))
-        for char in message:
-            textarea.type(char, delay=50 + (hash(char) % 80))
+        self.page.evaluate("""
+            (msg) => {
+                const el = document.querySelector('#chat-input')
+                    || document.querySelector('textarea[id="chat-input"]')
+                    || document.querySelector('textarea')
+                    || document.querySelector('textarea[placeholder]')
+                    || document.querySelector('[contenteditable="true"]');
+                if (!el) return false;
+                el.focus();
+                if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+                    el.value = msg;
+                } else {
+                    el.innerText = msg;
+                }
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                return true;
+            }
+        """, message)
+
         self.page.wait_for_timeout(300 + (hash(message) % 200))
 
         send_btn = self.page.query_selector('#send-message-button')
