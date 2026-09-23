@@ -1,7 +1,19 @@
 glmpp/__pycache__/
 
-glmpp/chatgpt_session
+glmpp/glm_session
 
 glmpp/profile/
 
 glmpp/cookies.json
+
+glmpp/.zai_credentials.json
+
+glmpp/.zai_token
+
+glmpp/.gemini_keys
+
+glmpp/main.py
+
+glmpp/.zai_device_identity.json
+
+glmpp/.browser_request.json
