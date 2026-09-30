@@ -146,6 +146,24 @@ curl -N http://127.0.0.1:3016/v1/chat/completions \
   -d '{"model":"glm-4","stream":true,"messages":[{"role":"user","content":"Hi"}]}'
 ```
 
+### Continuing a conversation
+
+Every `glm-4` response includes a `conversation_id` (in the final SSE chunk when streaming, or in the JSON body otherwise). Pass it back on the next request — as a body field or a header — to keep the same conversation:
+
+```bash
+# body field: conversation_id | session_id | chat_id
+curl -N http://127.0.0.1:3016/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"glm-4","stream":true,"conversation_id":"conv_123","messages":[...full history...]}'
+
+# or header: X-Session-Id | X-Conversation-Id | X-Chat-Id
+curl -N http://127.0.0.1:3016/v1/chat/completions \
+  -H 'Content-Type: application/json' -H 'X-Session-Id: conv_123' \
+  -d '{"model":"glm-4","stream":true,"messages":[...full history...]}'
+```
+
+Mappings persist to `glmpp/.zai_conversations.json`, so conversation ids survive server restarts. List them with `GET /v1/conversations`, clear with `DELETE /v1/conversations`. Always send the full message history — context comes from your `messages`, the id only pins the same Z.ai chat.
+
 ---
 
 ## Requirements

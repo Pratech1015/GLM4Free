@@ -17,3 +17,5 @@ glmpp/main.py
 glmpp/.zai_device_identity.json
 
 glmpp/.browser_request.json
+
+glmpp/.zai_conversations.json
