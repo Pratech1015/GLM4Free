@@ -201,7 +201,10 @@ async def _build_data_field(
     if cookie is None:
         cookie = _cookie_for_data()
     inp = json.dumps({"payload": payload, "cookie": cookie})
-    cli = os.environ.get("NV_DATA_CLI", "/tmp/nv_data_cli.js")
+    cli = os.environ.get("NV_DATA_CLI")
+    if not cli:
+        proj = os.path.join(os.path.dirname(__file__), "js", "nv_data_cli.js")
+        cli = proj if os.path.isfile(proj) else "/tmp/nv_data_cli.js"
     if not os.path.isfile(cli):
         raise RuntimeError(f"nv data CLI missing: {cli}")
 

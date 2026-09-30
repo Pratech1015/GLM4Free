@@ -177,28 +177,64 @@ class ZaiClient:
         sse = self._poll_sse(timeout)
         return sse.get("answer", "") or self._extract_last_assistant_message_from_dom()
 
-    def send_message_stream(self, message: str, timeout: int = 120):
-        """Send message and yield response chunks as they arrive."""
+    def send_message_stream(self, message: str, timeout: int = 120, include_thinking: bool = False):
+        """
+        Send message and yield response chunks as they arrive.
+
+        Yields answer text deltas. If include_thinking is True, also yields
+        thinking deltas (phase-prefixed strings "thinking:" / "answer:").
+        """
         if not self.page:
             raise RuntimeError("Client not started. Call start() first.")
         self._reset_sse()
         self._type_and_send(message)
         answer_len = 0
+        thinking_len = 0
         start = time.time()
         while time.time() - start < timeout:
             sse = self.page.evaluate("window.__zai_sse || {}")
             answer = sse.get("answer", "")
+            thinking = sse.get("thinking", "")
             done = sse.get("done", False)
+
+            if include_thinking and len(thinking) > thinking_len:
+                yield "thinking:" + thinking[thinking_len:]
+                thinking_len = len(thinking)
+
             if len(answer) > answer_len:
-                yield answer[answer_len:]
+                chunk = answer[answer_len:]
+                yield ("answer:" + chunk) if include_thinking else chunk
                 answer_len = len(answer)
+
             if done:
+                # flush any trailing buffered text
+                if include_thinking and len(thinking) > thinking_len:
+                    yield "thinking:" + thinking[thinking_len:]
+                if len(answer) > answer_len:
+                    chunk = answer[answer_len:]
+                    yield ("answer:" + chunk) if include_thinking else chunk
                 return
-            time.sleep(0.05)
+            time.sleep(0.03)
+
         if answer_len == 0:
             dom = self._extract_last_assistant_message_from_dom()
             if dom:
-                yield dom
+                yield ("answer:" + dom) if include_thinking else dom
+        elif len(answer) > answer_len or (include_thinking and len(thinking) > thinking_len):
+            if include_thinking and len(thinking) > thinking_len:
+                yield "thinking:" + thinking[thinking_len:]
+            if len(answer) > answer_len:
+                chunk = answer[answer_len:]
+                yield ("answer:" + chunk) if include_thinking else chunk
+
+    def send_message_stream_full(self, message: str, timeout: int = 120):
+        """
+        Stream thinking and answer as (phase, delta) tuples.
+        phase is 'thinking' or 'answer'.
+        """
+        for item in self.send_message_stream(message, timeout=timeout, include_thinking=True):
+            phase, _, delta = item.partition(":")
+            yield phase, delta
 
     def send_message_full(self, message: str, timeout: int = 120) -> dict:
         """Send message and return both thinking and response."""
@@ -309,10 +345,24 @@ def main():
                 if user_input.lower() in ('quit', 'exit', 'q'):
                     break
 
-                result = client.send_message_full(user_input)
-                if result.get("thinking"):
-                    print(f"[thinking] {result['thinking']}")
-                print(result.get("response", ""))
+                # Live-stream the reply (and thinking, if any)
+                print("Assistant: ", end="", flush=True)
+                thinking_buf = ""
+                answer_started = False
+                for phase, delta in client.send_message_stream_full(user_input):
+                    if not delta:
+                        continue
+                    if phase == "thinking":
+                        thinking_buf += delta
+                        print(f"\r[thinking] {thinking_buf}", end="", flush=True)
+                    else:
+                        if not answer_started:
+                            answer_started = True
+                            print(f"\r{' ' * 78}\r", end="")
+                        print(delta, end="", flush=True)
+                if thinking_buf and not answer_started:
+                    print()
+                print()
 
             except KeyboardInterrupt:
                 print("\n\nGoodbye!")

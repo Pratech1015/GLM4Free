@@ -13,6 +13,7 @@ import os
 import hmac
 import hashlib
 import base64
+import asyncio
 from typing import Optional, AsyncGenerator
 from datetime import datetime, timezone
 import aiohttp
@@ -21,6 +22,15 @@ CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), ".zai_credentials.jso
 
 # From zai_bundle.js sne(): first HMAC key literal
 _SIG_SECRET = b"key-@@@@)))()((9))-xxxx&&&%%%%%"
+
+
+def _import_captcha():
+    try:
+        from glmpp import captcha as m
+        return m
+    except ImportError:
+        import captcha as m
+        return m
 
 
 def _compute_signature(sorted_payload: str, prompt: str, timestamp: str) -> str:
@@ -427,6 +437,85 @@ class ZaiApiClient:
         self._last_msg_id = None
         self._history = []
 
+    @classmethod
+    async def bootstrap(cls, headless: bool = True, save: bool = True) -> "ZaiApiClient":
+        """Pure-HTTP: fresh guest token + captcha, then save. No browser."""
+        client = cls(
+            token="",
+            captcha_verify_param="",
+            device_id=os.environ.get("ZAI_DEVICE_ID", ""),
+            cookie="",
+        )
+        await client.refresh_session(headless=headless)
+        if save:
+            client.save_credentials()
+        return client
+
+    async def refresh_session(self, headless: bool = True) -> str:
+        """
+        Pure-HTTP guest re-auth: GET /api/v1/auths/ issues a fresh JWT + cookie,
+        then refresh captcha. No browser required.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            async with aiohttp.ClientSession(
+                headers={
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:151.0) Gecko/20100101 Firefox/151.0",
+                    "Accept": "*/*",
+                    "Accept-Language": "en-US",
+                    "Origin": self.BASE_URL,
+                    "Referer": f"{self.BASE_URL}/",
+                    "x-fe-version": "prod-fe-1.1.96",
+                    "x-region": "overseas",
+                },
+                loop=loop,
+            ) as s:
+                async with s.get(f"{self.BASE_URL}/api/v1/auths/") as resp:
+                    body = await resp.json()
+                    token = body.get("token") or ""
+                    if not token:
+                        raise RuntimeError(f"auths bootstrap failed: {resp.status} {body}")
+                    cookies = [f"{c.key}={c.value}" for c in s.cookie_jar]
+                    if not any(x.startswith("token=") for x in cookies):
+                        cookies.append(f"token={token}")
+                    cookie = "; ".join(cookies)
+            self.token = token
+            self.cookie = cookie
+            self._user_id, self._guest_name = self._parse_token(token)
+            print(f"[api] session refreshed (guest {self._guest_name})", flush=True)
+        except Exception as e:
+            print(f"[api] pure-HTTP session refresh failed ({e}); trying browser", flush=True)
+            fresh = await type(self).setup(headless=headless, save=True)
+            self.token = fresh.token or self.token
+            self.captcha_verify_param = fresh.captcha_verify_param
+            self.device_id = fresh.device_id or self.device_id
+            self.cookie = fresh.cookie or self.cookie
+
+        # fresh captcha (single-use)
+        try:
+            captcha_mod = _import_captcha()
+            self.captcha_verify_param = await captcha_mod.get_captcha_verify_param()
+        except Exception as e:
+            print(f"[captcha] refresh after session failed: {e}", flush=True)
+
+        self._chat_id = None
+        self._last_msg_id = None
+        self._force_inline_history = bool(self._history)
+        try:
+            self.save_credentials()
+        except OSError:
+            pass
+        await self.close()
+        await self._ensure_session()
+        return self.captcha_verify_param
+
+    @staticmethod
+    def _is_auth_error(text: str, status: Optional[int] = None) -> bool:
+        if status in (401, 403):
+            return True
+        t = text or ""
+        return "401 Unauthorized" in t or "Not authenticated" in t
+
     async def refresh_captcha(self, headless: bool = True) -> str:
         """
         Obtain a fresh single-use captcha.
@@ -436,7 +525,7 @@ class ZaiApiClient:
         or Node data builder).
         """
         try:
-            import captcha as captcha_mod
+            captcha_mod = _import_captcha()
 
             fresh_param = await captcha_mod.get_captcha_verify_param()
             self.captcha_verify_param = fresh_param
@@ -493,7 +582,24 @@ class ZaiApiClient:
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             text = await resp.text()
-            if resp.status != 200:
+            if resp.status != 200 and self._is_auth_error(text, resp.status):
+                print("[api] create chat unauthorized — refreshing session...", flush=True)
+                await self.refresh_session()
+                headers = {}
+                if self.cookie:
+                    headers["Cookie"] = self.cookie
+                if self.device_id:
+                    headers["X-Device-ID"] = self.device_id
+                async with self._session.post(
+                    f"{self.BASE_URL}/api/v1/chats/new",
+                    data=body,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp2:
+                    text = await resp2.text()
+                    if resp2.status != 200:
+                        raise RuntimeError(f"create chat failed {resp2.status}: {text}")
+            elif resp.status != 200:
                 raise RuntimeError(f"create chat failed {resp.status}: {text}")
             data = json.loads(text)
             chat_id = data.get("id") or (data.get("chat") or {}).get("id")
@@ -504,24 +610,36 @@ class ZaiApiClient:
             return chat_id
 
     async def _ensure_session(self):
-        if self._session is None or self._session.closed:
-            headers = {
-                "authorization": f"Bearer {self.token}",
-                "content-type": "application/json",
-                "accept": "*/*",
-                "accept-language": "en-US",
-                "x-fe-version": "prod-fe-1.1.96",
-                "x-region": "overseas",
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:151.0) Gecko/20100101 Firefox/151.0",
-                "Origin": "https://chat.z.ai",
-                "sec-fetch-dest": "empty",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-origin",
-            }
-            if self.cookie:
-                headers["Cookie"] = self.cookie
-            self._session = aiohttp.ClientSession(headers=headers)
-            self._own_session = True
+        loop = asyncio.get_running_loop()
+        if self._session is not None and not self._session.closed:
+            sess_loop = getattr(self._session, "_loop", None)
+            if sess_loop is loop:
+                return
+            # Session belongs to another/closed loop — recreate on this loop.
+            # Reusing it raises: "Timeout context manager should be used inside a task".
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+            self._session = None
+
+        headers = {
+            "authorization": f"Bearer {self.token}",
+            "content-type": "application/json",
+            "accept": "*/*",
+            "accept-language": "en-US",
+            "x-fe-version": "prod-fe-1.1.96",
+            "x-region": "overseas",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:151.0) Gecko/20100101 Firefox/151.0",
+            "Origin": "https://chat.z.ai",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+        }
+        if self.cookie:
+            headers["Cookie"] = self.cookie
+        self._session = aiohttp.ClientSession(headers=headers, loop=loop)
+        self._own_session = True
 
     async def close(self):
         if self._own_session and self._session and not self._session.closed:
@@ -639,7 +757,11 @@ class ZaiApiClient:
             ) as resp:
                 if resp.status != 200:
                     err_body = await resp.text()
-                    if self._is_retryable_session_error(err_body) and attempts < max_attempts:
+                    if self._is_auth_error(err_body, resp.status) and attempts < max_attempts:
+                        print("[api] Unauthorized — refreshing session...", flush=True)
+                        await self.refresh_session()
+                        captcha_error = True
+                    elif self._is_retryable_session_error(err_body) and attempts < max_attempts:
                         print("[api] Session/captcha error — refreshing captcha...")
                         await self.refresh_captcha()
                         captcha_error = True
@@ -778,6 +900,10 @@ class ZaiApiClient:
             ) as resp:
                 if resp.status != 200:
                     err_body = await resp.text()
+                    if self._is_auth_error(err_body, resp.status) and attempts < max_attempts:
+                        print("[api] Unauthorized — refreshing session...", flush=True)
+                        await self.refresh_session()
+                        continue
                     if self._is_captcha_error(err_body) and attempts < max_attempts:
                         print("[api] Captcha required/expired — refreshing captcha...")
                         await self.refresh_captcha()
