@@ -136,27 +136,27 @@ python glmpp/client.py
 ```bash
 curl -N http://127.0.0.1:3016/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"glm-4","stream":true,"messages":[{"role":"user","content":"Hi"}]}'
+  -d '{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hi"}]}'
 ```
 
-Models: `glm-4` (Z.ai), plus Gemini personalities (`boxar-1`, `yui`, `kurumi-tokisaki`, …).
+Models: `glm-5.3-flash` (Z.ai), plus Gemini personalities (`boxar-1`, `yui`, `kurumi-tokisaki`, …).
 
 ---
 
 ### Continuing A Conversation
 
-Every `glm-4` response includes a `conversation_id` — pass it back to keep the same conversation:
+Every `glm-5.3-flash` response includes a `conversation_id` — pass it back to keep the same conversation:
 
 ```bash
 # body field: conversation_id | session_id | chat_id
 curl -N http://127.0.0.1:3016/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"glm-4","stream":true,"conversation_id":"conv_123","messages":[...]}'
+  -d '{"model":"glm-5.3-flash","stream":true,"conversation_id":"conv_123","messages":[...]}'
 
 # or header: X-Session-Id | X-Conversation-Id | X-Chat-Id
 curl -N http://127.0.0.1:3016/v1/chat/completions \
   -H 'Content-Type: application/json' -H 'X-Session-Id: conv_123' \
-  -d '{"model":"glm-4","stream":true,"messages":[...]}'
+  -d '{"model":"glm-5.3-flash","stream":true,"messages":[...]}'
 ```
 
 > [!NOTE]
