@@ -7,6 +7,10 @@ the script snatches the Authorization bearer token from browser traffic
 (or localStorage), grabs cookies, queries /api/models, and saves
 everything to .zai_credentials.json.
 
+The browser session (cookies + localStorage) is remembered in
+.zai_browser_state.json, so reruns restore it and skip login while the
+token stays valid. client.py reuses the same file.
+
 Logged-in credentials unlock extra models (glm-5.2, glm-5.3) beyond
 glm-5.3-flash.
 
@@ -29,6 +33,7 @@ from playwright.async_api import async_playwright
 AUTH_URL = "https://chat.z.ai/auth"
 MODELS_URL = "https://chat.z.ai/api/models"
 CREDENTIALS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".zai_credentials.json")
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".zai_browser_state.json")
 
 
 def jwt_claims(token: str) -> dict:
@@ -48,7 +53,8 @@ def is_guest(token: str) -> bool:
     return (not claims) or "guest" in email.lower()
 
 
-async def fetch_models(request, bearer: str) -> list:
+async def fetch_models(request, bearer: str) -> tuple[int, list]:
+    """Returns (status, model_ids). status 0 = network failure."""
     try:
         resp = await request.get(
             MODELS_URL,
@@ -59,8 +65,7 @@ async def fetch_models(request, bearer: str) -> list:
             },
         )
         if not resp.ok:
-            print(f"[login] /api/models -> {resp.status}")
-            return []
+            return resp.status, []
         data = await resp.json()
         items = data.get("data") if isinstance(data, dict) else data
         if isinstance(items, dict):
@@ -73,10 +78,10 @@ async def fetch_models(request, bearer: str) -> list:
                     ids.append(str(mid))
             elif m:
                 ids.append(str(m))
-        return ids
+        return resp.status, ids
     except Exception as e:
         print(f"[login] model list fetch failed: {e}")
-        return []
+        return 0, []
 
 
 async def login(timeout_s: int = 600, headless: bool = False) -> None:
@@ -88,14 +93,20 @@ async def login(timeout_s: int = 600, headless: bool = False) -> None:
                 "useAutomationExtension": False,
             },
         )
+        # Restore remembered browser session if we have one
+        restore_state = STATE_FILE if os.path.exists(STATE_FILE) else None
+        if restore_state:
+            print(f"[login] Restoring remembered session from {os.path.basename(STATE_FILE)}")
         context = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
             user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:151.0) Gecko/20100101 Firefox/151.0",
+            storage_state=restore_state,
         )
         page = await context.new_page()
 
         captured = {"bearer": ""}
+        rejected: set[str] = set()
 
         def on_request(req):
             try:
@@ -111,29 +122,51 @@ async def login(timeout_s: int = 600, headless: bool = False) -> None:
 
         await page.goto(AUTH_URL, wait_until="domcontentloaded", timeout=60000)
         print(f"[login] Opened {AUTH_URL}")
-        print("[login] Complete login in the Firefox window (waiting for a non-guest token)...")
+        print("[login] Waiting for a valid logged-in token (log in if the page asks)...")
 
         token = ""
+        models: list = []
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             try:
                 ls_token = await page.evaluate("localStorage.getItem('token') || ''")
             except Exception:
                 ls_token = ""
+            # Prefer fresh localStorage token, fall back to sniffed traffic
             if ls_token and not is_guest(ls_token):
-                token = ls_token
-                break
-            if captured["bearer"]:
-                token = captured["bearer"]
-                break
-            await asyncio.sleep(0.5)
+                candidate = ls_token
+            elif captured["bearer"]:
+                candidate = captured["bearer"]
+            else:
+                await asyncio.sleep(0.5)
+                continue
+
+            if candidate in rejected:
+                await asyncio.sleep(0.5)
+                continue
+
+            # Validate against /api/models — expired sessions come back 401/403
+            status, model_ids = await fetch_models(page.request, candidate)
+            if status in (401, 403):
+                print(f"[login] Stored session expired ({status}) — log in again in the window")
+                rejected.add(candidate)
+                captured["bearer"] = ""
+                try:
+                    await page.evaluate("localStorage.removeItem('token')")
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+                continue
+
+            token = candidate
+            models = model_ids
+            break
 
         if not token:
             await browser.close()
-            raise SystemExit(f"[login] Timed out after {timeout_s}s — no logged-in token seen.")
+            raise SystemExit(f"[login] Timed out after {timeout_s}s — no valid logged-in token seen.")
 
-        bearer = captured["bearer"] or token
-        claims = jwt_claims(bearer)
+        claims = jwt_claims(token)
         email = str(claims.get("email") or "")
         user_id = str(claims.get("id") or claims.get("sub") or "")
 
@@ -141,7 +174,12 @@ async def login(timeout_s: int = 600, headless: bool = False) -> None:
         cookies = await context.cookies("https://chat.z.ai")
         cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
 
-        models = await fetch_models(page.request, bearer)
+        # Remember this browser session so reruns skip the login
+        try:
+            await context.storage_state(path=STATE_FILE)
+            print(f"[login] Browser session remembered in {os.path.basename(STATE_FILE)}")
+        except OSError as e:
+            print(f"[login] Could not save browser state: {e}")
 
         await browser.close()
 
@@ -156,7 +194,7 @@ async def login(timeout_s: int = 600, headless: bool = False) -> None:
 
     creds = {
         **existing,
-        "token": bearer,
+        "token": token,
         "cookie": cookie_header or existing.get("cookie", ""),
         "logged_in": True,
         "email": email,
@@ -167,7 +205,7 @@ async def login(timeout_s: int = 600, headless: bool = False) -> None:
     with open(CREDENTIALS_FILE, "w") as f:
         json.dump(creds, f, indent=2)
 
-    print(f"[login] Logged in as {email or user_id or bearer[:24] + '...'}")
+    print(f"[login] Logged in as {email or user_id or token[:24] + '...'}")
     if models:
         print(f"[login] Models from /api/models: {', '.join(models)}")
     else:

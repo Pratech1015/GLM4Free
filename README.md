@@ -63,6 +63,9 @@ python glmpp/login.py
 Opens Playwright Firefox at `https://chat.z.ai/auth`. Log in normally — the script snatches the `Authorization` bearer token from browser traffic, grabs cookies, queries `/api/models`, and saves everything to `glmpp/.zai_credentials.json`.
 
 > [!NOTE]
+> The browser session is remembered in `glmpp/.zai_browser_state.json`. Reruns restore it and skip login while the token stays valid; if it expired, the script clears it and asks you to log in again. `client.py` reuses the same file, so it starts logged in too.
+
+> [!NOTE]
 > Logged-in credentials unlock **glm-5.2** and **glm-5.3** in `/v1/models` alongside `glm-5.3-flash`. If the token expires or gets downgraded to guest, rerun `python glmpp/login.py`.
 
 > [!TIP]

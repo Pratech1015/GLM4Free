@@ -7,11 +7,15 @@ For initial setup and interactive chat via browser.
 """
 
 import asyncio
+import os
 import time
 import random
 from typing import Optional, List
 from dataclasses import dataclass
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+
+# Shared with login.py — remembered browser session (cookies + localStorage)
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".zai_browser_state.json")
 
 
 @dataclass
@@ -43,6 +47,7 @@ class ZaiClient:
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
             user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+            storage_state=STATE_FILE if os.path.exists(STATE_FILE) else None,
         )
         await self.context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -112,6 +117,12 @@ class ZaiClient:
     async def wait_for_auth(self) -> Optional[str]:
         await asyncio.to_thread(input, "Complete captcha/login, then press ENTER...")
         token = await self.page.evaluate("localStorage.getItem('token')")
+        # Remember whatever session state we ended up with
+        try:
+            if self.context:
+                await self.context.storage_state(path=STATE_FILE)
+        except OSError:
+            pass
         return token
 
     async def _reset_sse(self) -> None:
