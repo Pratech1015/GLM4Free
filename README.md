@@ -54,6 +54,20 @@ cd glmpp
 python main.py
 ```
 
+### Log In (Optional — Unlocks More Models)
+
+```bash
+python glmpp/login.py
+```
+
+Opens Playwright Firefox at `https://chat.z.ai/auth`. Log in normally — the script snatches the `Authorization` bearer token from browser traffic, grabs cookies, queries `/api/models`, and saves everything to `glmpp/.zai_credentials.json`.
+
+> [!NOTE]
+> Logged-in credentials unlock **glm-5.2** and **glm-5.3** in `/v1/models` alongside `glm-5.3-flash`. If the token expires or gets downgraded to guest, rerun `python glmpp/login.py`.
+
+> [!TIP]
+> Pass `--timeout 900` if you need more time to complete the login.
+
 > [!NOTE]
 > The server loads saved credentials automatically and re-bootstraps the session on 401.
 
@@ -67,6 +81,7 @@ glmpp/
 ├── api.py            # async pure-HTTP Z.ai client
 ├── captcha.py        # pure-HTTP Aliyun captcha flow
 ├── client.py         # async Playwright browser client
+├── login.py          # capture logged-in bearer token (unlocks glm-5.2 / glm-5.3)
 ├── main.py           # OpenAI-compatible server
 ├── setup.py          # one-time browser credential extract
 ├── js/               # vendored captcha builders (Node)
@@ -139,7 +154,7 @@ curl -N http://127.0.0.1:3016/v1/chat/completions \
   -d '{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Hi"}]}'
 ```
 
-Models: `glm-5.3-flash` (Z.ai), plus Gemini personalities (`boxar-1`, `yui`, `kurumi-tokisaki`, …).
+Models: `glm-5.3-flash` (Z.ai), plus Gemini personalities (`boxar-1`, `yui`, `kurumi-tokisaki`, …). After `login.py`, also `glm-5.2` and `glm-5.3`.
 
 ---
 

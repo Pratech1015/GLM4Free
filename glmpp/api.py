@@ -416,7 +416,16 @@ class ZaiApiClient:
         return client
 
     def save_credentials(self, path: str = CREDENTIALS_FILE):
+        # Preserve extra fields (logged_in, email, models) set by login.py
+        existing = {}
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    existing = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                existing = {}
         creds = {
+            **existing,
             "token": self.token,
             "captcha_verify_param": self.captcha_verify_param,
             "device_id": self.device_id,
@@ -424,6 +433,20 @@ class ZaiApiClient:
         }
         with open(path, "w") as f:
             json.dump(creds, f, indent=2)
+
+    @staticmethod
+    def _mark_logged_out(path: str = CREDENTIALS_FILE):
+        """Guest re-auth invalidates a logged-in token — clear the flag."""
+        try:
+            with open(path) as f:
+                creds = json.load(f)
+            if creds.get("logged_in"):
+                creds["logged_in"] = False
+                creds["token_downgraded_at"] = int(time.time())
+                with open(path, "w") as f:
+                    json.dump(creds, f, indent=2)
+        except (json.JSONDecodeError, OSError):
+            pass
 
     @classmethod
     def auto_init(cls, credentials_path: str = CREDENTIALS_FILE) -> Optional["ZaiApiClient"]:
@@ -503,6 +526,7 @@ class ZaiApiClient:
         self._force_inline_history = bool(self._history)
         try:
             self.save_credentials()
+            self._mark_logged_out()
         except OSError:
             pass
         await self.close()
@@ -570,6 +594,8 @@ class ZaiApiClient:
         """Create a server-side chat before the first completion (required)."""
         await self._ensure_session()
         headers = {}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
         if self.cookie:
             headers["Cookie"] = self.cookie
         if self.device_id:
@@ -646,7 +672,7 @@ class ZaiApiClient:
             await self._session.close()
             self._session = None
 
-    def _build_request(self, messages: list, chat_id: str) -> tuple:
+    def _build_request(self, messages: list, chat_id: str, model: Optional[str] = None) -> tuple:
         """Build signed URL and payload for a chat completion request."""
         timestamp = str(int(time.time() * 1000))
         request_id = str(uuid.uuid4())
@@ -671,7 +697,7 @@ class ZaiApiClient:
         local_str = local_now.strftime("%Y-%m-%d %H:%M:%S")
         payload = {
             "stream": True,
-            "model": "x-preview-l",
+            "model": model or "x-preview-l",
             "messages": messages,
             "signature_prompt": prompt,
             "params": {},
@@ -711,7 +737,7 @@ class ZaiApiClient:
 
         return url, payload, timestamp, signature
 
-    async def _do_stream(self, messages: list, timeout: int = 120, chat_id: Optional[str] = None) -> AsyncGenerator[str, None]:
+    async def _do_stream(self, messages: list, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None) -> AsyncGenerator[str, None]:
         await self._ensure_session()
 
         if chat_id is not None:
@@ -738,9 +764,11 @@ class ZaiApiClient:
                     parts.append(f"{prefix}: {m.get('content', '')}")
                 parts.append("Assistant:")
                 msgs = [{"role": "user", "content": "\n".join(parts)}]
-            url, payload, ts, signature = self._build_request(msgs, self._chat_id)
+            url, payload, ts, signature = self._build_request(msgs, self._chat_id, model=model)
             self._last_msg_id = payload["id"]
             headers = {"X-Signature": signature}
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
             if self.device_id:
                 headers["X-Device-ID"] = self.device_id
             if self.cookie:
@@ -820,10 +848,10 @@ class ZaiApiClient:
 
         raise RuntimeError("Captcha refresh attempts exhausted. Run 'python3 setup.py --visible'.")
 
-    async def send_message(self, message: str, timeout: int = 120, chat_id: Optional[str] = None) -> str:
+    async def send_message(self, message: str, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None) -> str:
         self._history.append({"role": "user", "content": message})
         chunks = []
-        async for chunk in self.send_message_stream(message, timeout, chat_id=chat_id, use_history=True):
+        async for chunk in self.send_message_stream(message, timeout, chat_id=chat_id, use_history=True, model=model):
             chunks.append(chunk)
         reply = "".join(chunks)
         if reply:
@@ -836,6 +864,7 @@ class ZaiApiClient:
         timeout: int = 120,
         chat_id: Optional[str] = None,
         use_history: bool = True,
+        model: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         if use_history and self._history and self._history[-1] == {"role": "user", "content": message}:
             messages = list(self._history)
@@ -843,14 +872,14 @@ class ZaiApiClient:
             messages = list(self._history) + [{"role": "user", "content": message}]
         else:
             messages = [{"role": "user", "content": message}]
-        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id):
+        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model):
             yield chunk
         # caller of stream API may not append assistant; do it if stream completed
         # (send_message appends itself — detect via use_history ownership)
 
-    async def send_messages(self, messages: list, timeout: int = 120, chat_id: Optional[str] = None) -> str:
+    async def send_messages(self, messages: list, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None) -> str:
         chunks = []
-        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id):
+        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model):
             chunks.append(chunk)
         reply = "".join(chunks)
         self._history = list(messages)
@@ -858,11 +887,11 @@ class ZaiApiClient:
             self._history.append({"role": "assistant", "content": reply})
         return reply
 
-    async def send_messages_stream(self, messages: list, timeout: int = 120, chat_id: Optional[str] = None) -> AsyncGenerator[str, None]:
-        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id):
+    async def send_messages_stream(self, messages: list, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None) -> AsyncGenerator[str, None]:
+        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model):
             yield chunk
 
-    async def send_message_full(self, message: str, timeout: int = 120, chat_id: Optional[str] = None) -> dict:
+    async def send_message_full(self, message: str, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None) -> dict:
         await self._ensure_session()
 
         if chat_id is not None:
@@ -881,12 +910,14 @@ class ZaiApiClient:
             attempts += 1
             if self._chat_id is None:
                 await self.create_conversation()
-            url, payload, ts, signature = self._build_request([{"role": "user", "content": message}], self._chat_id)
+            url, payload, ts, signature = self._build_request([{"role": "user", "content": message}], self._chat_id, model=model)
             self._last_msg_id = payload["id"]
             thinking = ""
             answer = ""
 
             req_headers = {"X-Signature": signature}
+            if self.token:
+                req_headers["Authorization"] = f"Bearer {self.token}"
             if self.device_id:
                 req_headers["X-Device-ID"] = self.device_id
             if self.cookie:
