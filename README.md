@@ -1,83 +1,114 @@
 # GLM4Free
 
-GLM4Free API — async OpenAI-compatible server plus Z.ai browser/API clients (with streaming).
+![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
+![Async](https://img.shields.io/badge/async-supported-green.svg)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
+![Status](https://img.shields.io/badge/status-working-brightgreen.svg)
 
-## Install
+Async Z.ai/GLM chat stack: a pure-HTTP API client, an async Playwright browser client, and an OpenAI-compatible server with streaming.
+
+> [!WARNING]
+> Built on reverse-engineered Z.ai infrastructure. API changes may break functionality without notice.
+
+> [!IMPORTANT]
+> Credentials are required before the API client works. Run `await ZaiApiClient.bootstrap()` once — it fetches a fresh guest token and captcha purely over HTTP, no browser needed.
+
+---
+
+## Overview
+
+* pure-HTTP Z.ai client — signed requests, SSE streaming, auto captcha and session refresh
+* async Playwright browser client with in-page SSE interception
+* OpenAI-compatible server (`/v1/chat/completions`, SSE) on port 3016
+* conversation continuation via `conversation_id` or `X-Session-Id`
+* guest-token auto refresh on 401
+
+---
+
+## Installation
 
 ```bash
 pip install aiohttp playwright google-generativeai cryptography
 playwright install firefox
 ```
 
-Credentials live under `glmpp/` (see `.gitignore`). Run one-time setup if needed:
-
-```bash
-cd glmpp
-python setup.py            # headless browser credential extract
-python setup.py --visible  # show browser window
-```
-
-After setup, the pure-HTTP API client works without a browser.
+Credentials are stored under `glmpp/` (gitignored).
 
 ---
 
-## 1. Async API client (`glmpp/api.py`)
+## Quick Start
 
-Pure HTTP — no browser. Signs requests, streams SSE, auto-refreshes captcha.
+### Bootstrap Credentials
 
-### Quick start
+```python
+import asyncio
+from glmpp.api import ZaiApiClient
+
+client = await ZaiApiClient.bootstrap()   # pure HTTP, saves credentials
+```
+
+### Start The Server
+
+```bash
+cd glmpp
+python main.py
+```
+
+> [!NOTE]
+> The server loads saved credentials automatically and re-bootstraps the session on 401.
+
+---
+
+## Project Structure
+
+```
+glmpp/
+│
+├── api.py            # async pure-HTTP Z.ai client
+├── captcha.py        # pure-HTTP Aliyun captcha flow
+├── client.py         # async Playwright browser client
+├── main.py           # OpenAI-compatible server
+├── setup.py          # one-time browser credential extract
+├── js/               # vendored captcha builders (Node)
+└── README.md
+```
+
+---
+
+## Usage
+
+### Async API Client
 
 ```python
 import asyncio
 from glmpp.api import ZaiApiClient
 
 async def main():
-    client = ZaiApiClient.auto_init()
-    if not client:
-        raise SystemExit("No credentials. Run: python glmpp/setup.py")
+    client = ZaiApiClient.auto_init()     # load saved credentials
 
     # One-shot
     reply = await client.send_message("Hello!")
     print(reply)
 
-    # Streaming (answer deltas only)
+    # Streaming
     async for chunk in client.send_message_stream("Tell me a story"):
         print(chunk, end="", flush=True)
-    print()
 
-    # Full response with thinking
+    # With thinking
     result = await client.send_message_full("Explain relativity")
     print("Thinking:", result["thinking"])
-    print("Response:", result["response"])
+
+    await client.close()
 
 asyncio.run(main())
 ```
 
-### API reference
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `ZaiApiClient.auto_init()` | `ZaiApiClient \| None` | Load creds from env / `.zai_credentials.json` |
-| `await send_message(text)` | `str` | Append to history, return full reply |
-| `send_message_stream(text)` | `AsyncGenerator[str]` | Yield answer chunks |
-| `await send_message_full(text)` | `dict` | `{"thinking": str, "response": str}` |
-| `await refresh_captcha()` | `str` | Fresh single-use captcha (pure HTTP; browser fallback) |
-| `await create_conversation()` | `str` | New server-side chat id |
-| `await close()` | `None` | Close aiohttp session |
+> [!TIP]
+> `send_message_stream` also accepts `chat_id=` to pin a specific Z.ai conversation.
 
 ---
 
-## 2. Browser client (`glmpp/client.py`)
-
-Playwright async API + Firefox. Intercepts chat.z.ai SSE in-page and streams tokens.
-
-### Interactive chat (streams live)
-
-```bash
-python glmpp/client.py
-```
-
-### In code
+### Browser Client
 
 ```python
 import asyncio
@@ -85,59 +116,22 @@ from glmpp.client import ZaiClient
 
 async def chat():
     async with ZaiClient(headless=True) as client:
-        await client.wait_for_auth()   # complete captcha in browser if prompted
-
-        # Streaming answer only
+        await client.wait_for_auth()      # solve captcha in browser if prompted
         async for chunk in client.send_message_stream("Hello"):
             print(chunk, end="", flush=True)
-        print()
-
-        # Streaming thinking + answer as (phase, delta)
-        async for phase, delta in client.send_message_stream_full("Explain relativity"):
-            print(f"[{phase}] {delta}", end="", flush=True)
-        print()
-
-        # Non-streaming
-        reply = await client.send_message("Hello")
-        full = await client.send_message_full("Hello")   # {"thinking", "response"}
 
 asyncio.run(chat())
 ```
 
-Async context manager:
+Interactive chat (streams live):
 
-```python
-async with ZaiClient(headless=True) as client:
-    await client.wait_for_auth()
-    print(await client.send_message("Hi"))
+```bash
+python glmpp/client.py
 ```
-
-### API reference
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `await start()` | `None` | Launch Firefox, load chat.z.ai, inject SSE interceptor |
-| `await wait_for_auth()` | `str \| None` | Pause for captcha/login, return token |
-| `await send_message(text)` | `str` | Send, wait, return answer |
-| `async for ... in send_message_stream(text)` | `AsyncGenerator[str]` | Yield answer chunks (optionally `include_thinking=True` → `"thinking:"`/`"answer:"` prefixes) |
-| `async for ... in send_message_stream_full(text)` | `AsyncGenerator[tuple[str, str]]` | Yield `(phase, delta)` where phase is `thinking` or `answer` |
-| `await send_message_full(text)` | `dict` | `{"thinking": str, "response": str}` |
-| `await get_chat_history()` | `list[ChatMessage]` | Read messages from DOM |
-| `await close()` | `None` | Close browser |
 
 ---
 
-## 3. OpenAI-compatible server (`glmpp/main.py`)
-
-Serves `/v1/chat/completions` (SSE when `"stream": true`) on port **3016**.
-
-```bash
-python glmpp/main.py
-```
-
-Models: `glm-4` (Z.ai via pure-HTTP client), plus Gemini personalities (`boxar-1`, `yui`, `kurumi-tokisaki`, …).
-
-Example:
+### OpenAI-Compatible Server
 
 ```bash
 curl -N http://127.0.0.1:3016/v1/chat/completions \
@@ -145,29 +139,60 @@ curl -N http://127.0.0.1:3016/v1/chat/completions \
   -d '{"model":"glm-4","stream":true,"messages":[{"role":"user","content":"Hi"}]}'
 ```
 
-### Continuing a conversation
+Models: `glm-4` (Z.ai), plus Gemini personalities (`boxar-1`, `yui`, `kurumi-tokisaki`, …).
 
-Every `glm-4` response includes a `conversation_id` (in the final SSE chunk when streaming, or in the JSON body otherwise). Pass it back on the next request — as a body field or a header — to keep the same conversation:
+---
+
+### Continuing A Conversation
+
+Every `glm-4` response includes a `conversation_id` — pass it back to keep the same conversation:
 
 ```bash
 # body field: conversation_id | session_id | chat_id
 curl -N http://127.0.0.1:3016/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"glm-4","stream":true,"conversation_id":"conv_123","messages":[...full history...]}'
+  -d '{"model":"glm-4","stream":true,"conversation_id":"conv_123","messages":[...]}'
 
 # or header: X-Session-Id | X-Conversation-Id | X-Chat-Id
 curl -N http://127.0.0.1:3016/v1/chat/completions \
   -H 'Content-Type: application/json' -H 'X-Session-Id: conv_123' \
-  -d '{"model":"glm-4","stream":true,"messages":[...full history...]}'
+  -d '{"model":"glm-4","stream":true,"messages":[...]}'
 ```
 
-Mappings persist to `glmpp/.zai_conversations.json`, so conversation ids survive server restarts. List them with `GET /v1/conversations`, clear with `DELETE /v1/conversations`. Always send the full message history — context comes from your `messages`, the id only pins the same Z.ai chat.
+> [!NOTE]
+> Mappings persist to `glmpp/.zai_conversations.json` and survive restarts. List with `GET /v1/conversations`, clear with `DELETE /v1/conversations`. Always send the full `messages` history — context comes from your messages; the id only pins the same Z.ai chat.
 
 ---
 
-## Requirements
+## Architecture
 
-- Python 3.10+
-- `aiohttp`, `cryptography`
-- `playwright` + Firefox (browser client / one-time setup only)
-- Internet connection
+### 1. API Layer (`api.py`)
+
+Pure-HTTP async client: request signing, SSE parsing, conversation creation, and automatic recovery — captcha refresh on failure, guest-token re-auth on 401.
+
+### 2. Captcha Layer (`captcha.py`)
+
+Browser-free Aliyun TRACELESS flow built on a known-good device identity, with the `pe.059` data builder vendored under `js/` and run in Node.
+
+### 3. Server Layer (`main.py`)
+
+aiohttp server exposing OpenAI-compatible endpoints, mapping `conversation_id` to Z.ai chat ids and flattening client history into each upstream request.
+
+---
+
+## Notes
+
+> [!CAUTION]
+> This project is experimental and based on reverse-engineered behavior of Z.ai's infrastructure. The API may change at any time, and use may violate Z.ai's terms of service. Use at your own risk.
+
+> [!TIP]
+> If requests start failing with 401, just call `await client.refresh_session()` — it fetches a fresh guest token and captcha without a browser.
+
+> [!TIP]
+> Captcha generation is occasionally flaky; retry once or twice before falling back to the browser client.
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
