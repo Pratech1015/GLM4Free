@@ -11,7 +11,7 @@ Async Z.ai/GLM chat stack: a pure-HTTP API client, an async Playwright browser c
 > Built on reverse-engineered Z.ai infrastructure. API changes may break functionality without notice.
 
 > [!IMPORTANT]
-> Credentials are required before the API client works. Run `await ZaiApiClient.bootstrap()` once — it fetches a fresh guest token and captcha purely over HTTP, no browser needed.
+> Credentials are required before the API client works. Run `await ZaiApiClient.bootstrap()` once — it fetches a fresh guest token and captcha purely over HTTP, no browser needed (falls back to the browser if the solver gets risk-blocked).
 
 ---
 
@@ -117,13 +117,22 @@ async def main():
     result = await client.send_message_full("Explain relativity")
     print("Thinking:", result["thinking"])
 
+    # Per-request options (same fields the server accepts)
+    reply = await client.send_message(
+        "Latest AI news?",
+        web_search=True,              # or advanced_web_search=True
+        deep_think=True,
+        reasoning_effort="low",       # low | high | max
+        attachments=["/path/to/img.png"],   # login required
+    )
+
     await client.close()
 
 asyncio.run(main())
 ```
 
 > [!TIP]
-> `send_message_stream` also accepts `chat_id=` to pin a specific Z.ai conversation.
+> `send_message_stream` also accepts `chat_id=` to pin a specific Z.ai conversation, plus the same option kwargs (`web_search`, `advanced_web_search`, `deep_think`, `reasoning_effort`, `attachments`).
 
 ---
 
@@ -159,6 +168,8 @@ curl -N http://127.0.0.1:3016/v1/chat/completions \
 ```
 
 Models: `glm-5.3-flash` (Z.ai), plus Gemini personalities (`boxar-1`, `yui`, `kurumi-tokisaki`, …). After `login.py`, also `glm-5.2` and `glm-5.3`.
+
+Request extras: web search, deep think / reasoning effort, and attachments — see the sections below.
 
 ---
 
