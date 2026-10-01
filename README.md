@@ -21,6 +21,7 @@ Async Z.ai/GLM chat stack: a pure-HTTP API client, an async Playwright browser c
 * async Playwright browser client with in-page SSE interception
 * OpenAI-compatible server (`/v1/chat/completions`, SSE) on port 3016
 * conversation continuation via `conversation_id` or `X-Session-Id`
+* web search, deep think (`low`/`high`/`max`), and attachments (login)
 * guest-token auto refresh on 401
 
 ---
@@ -182,6 +183,66 @@ curl -N http://127.0.0.1:3016/v1/chat/completions \
 
 ---
 
+### Web Search
+
+Toggle Z.ai's built-in web search per request:
+
+```bash
+curl -N http://127.0.0.1:3016/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"glm-5.3-flash","stream":true,"web_search":true,"messages":[{"role":"user","content":"Latest AI news?"}]}'
+```
+
+| Field | Effect |
+|---|---|
+| `web_search` | Standard web search (`auto_web_search`) |
+| `advanced_web_search` | Advanced search (search + `web_search` features) |
+
+---
+
+### Deep Think
+
+```bash
+curl -N http://127.0.0.1:3016/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"glm-5.3-flash","stream":true,"deep_think":true,"reasoning_effort":"low","messages":[{"role":"user","content":"Solve: 2x+5=17"}]}'
+```
+
+| Field | Values | Default |
+|---|---|---|
+| `deep_think` | `true` / `false` | `true` |
+| `reasoning_effort` | `low` / `high` / `max` | `max` |
+
+> [!NOTE]
+> `reasoning_effort` is only sent while `deep_think` is enabled, matching the Z.ai frontend.
+
+---
+
+### Attachments
+
+> [!IMPORTANT]
+> Attachments upload through `POST /api/v1/files/`, which rejects guest tokens — **login required** (`python glmpp/login.py`).
+
+```bash
+curl -N http://127.0.0.1:3016/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"glm-5.3-flash","stream":true,"attachments":["/path/to/image.png"],"messages":[{"role":"user","content":"Describe this"}]}'
+```
+
+`attachments` accepts local paths, `https://` URLs, and `data:` URIs. OpenAI-style content parts work too:
+
+```json
+{"role":"user","content":[
+  {"type":"text","text":"Describe this"},
+  {"type":"image_url","image_url":{"url":"data:image/png;base64,...."}}
+]}
+```
+
+> [!NOTE]
+> Images become `image_url` parts, videos `video_url`, everything else `file_url` (text extraction enabled). Already-uploaded Z.ai file ids pass through untouched.
+
+---
+
 ## Architecture
 
 ### 1. API Layer (`api.py`)
@@ -207,7 +268,7 @@ aiohttp server exposing OpenAI-compatible endpoints, mapping `conversation_id` t
 > If requests start failing with 401, just call `await client.refresh_session()` — it fetches a fresh guest token and captcha without a browser.
 
 > [!TIP]
-> Captcha generation is occasionally flaky; retry once or twice before falling back to the browser client.
+> Captcha generation is occasionally flaky; retry once or twice before falling back to the browser. If the pure-HTTP solver gets risk-blocked (Aliyun `F001`), the client automatically falls back to a real browser (`playwright install firefox`) for the refresh.
 
 ---
 

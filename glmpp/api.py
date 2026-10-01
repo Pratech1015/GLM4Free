@@ -672,11 +672,154 @@ class ZaiApiClient:
             await self._session.close()
             self._session = None
 
-    def _build_request(self, messages: list, chat_id: str, model: Optional[str] = None) -> tuple:
+    @staticmethod
+    def _content_text(content) -> str:
+        """Plain text of a message content (string or OpenAI-style parts list)."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        return str(content)
+
+    @staticmethod
+    def _attachment_media(name: str) -> str:
+        ext = os.path.splitext(name or "")[1].lower()
+        if ext in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
+            return "image"
+        if ext in {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}:
+            return "video"
+        return "doc"
+
+    async def upload_attachment(self, source, filename: Optional[str] = None) -> dict:
+        """
+        Upload an attachment (login-only — guest tokens get 401).
+
+        source: local path, http(s) URL, or data: URI.
+        Returns {"part": content part for the message, "file": metadata for payload files}.
+        """
+        import mimetypes
+
+        remote_url = None
+        data = None
+        name = filename
+        if isinstance(source, dict) and source.get("type") in ("image_url", "file_url", "video_url"):
+            url = (source.get(source["type"]) or {}).get("url") or ""
+            # Inline/external refs are re-uploaded to Z.ai (FE direct_upload_url);
+            # file ids and chat.z.ai URLs pass through as-is.
+            if url.startswith("data:") or (
+                url.startswith(("http://", "https://")) and not url.startswith(self.BASE_URL + "/")
+            ):
+                return await self.upload_attachment(url)
+            return {"part": source, "file": {}}
+        if isinstance(source, str) and source.startswith(("http://", "https://")):
+            remote_url = source
+            name = name or source.rsplit("/", 1)[-1].split("?")[0] or "file"
+        elif isinstance(source, str) and source.startswith("data:"):
+            # data:[<mime>][;base64],<payload>
+            header, _, payload = source.partition(",")
+            if ";base64" in header:
+                data = base64.b64decode(payload)
+            else:
+                from urllib.parse import unquote_to_bytes
+                data = unquote_to_bytes(payload)
+            mime = header[5:].split(";")[0] if header.startswith("data:") else ""
+            ext = mimetypes.guess_extension(mime) if mime else None
+            name = name or f"attachment{ext or ''}"
+        else:
+            path = str(source)
+            with open(path, "rb") as f:
+                data = f.read()
+            name = name or os.path.basename(path)
+
+        media = self._attachment_media(name)
+        form = aiohttp.FormData()
+        if remote_url:
+            form.add_field("direct_upload_url", remote_url)
+        else:
+            ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+            form.add_field("file", data, filename=name, content_type=ctype)
+            if media == "doc":
+                form.add_field("extract", "true")
+
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        if self.cookie:
+            headers["Cookie"] = self.cookie
+        if self._chat_id:
+            headers["x-chat-id"] = self._chat_id
+
+        # Fresh session so FormData's multipart content-type isn't overridden
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"{self.BASE_URL}/api/v1/files/",
+                data=form,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    hint = ""
+                    if resp.status in (401, 403):
+                        hint = " — attachments require a logged-in token (run login.py)"
+                    raise RuntimeError(f"attachment upload failed {resp.status}: {text[:300]}{hint}")
+                try:
+                    body = json.loads(text)
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(f"attachment upload bad response: {text[:300]}") from e
+
+        file_id = str(body.get("id") or body.get("file_id") or "")
+        direct_url = body.get("direct_url") or ""
+        url = direct_url or body.get("url") or body.get("content_url") or file_id
+        if not url:
+            raise RuntimeError(f"attachment upload no url/id: {text[:300]}")
+
+        key = {"image": "image_url", "video": "video_url"}.get(media, "file_url")
+        part = {"type": key, key: {"url": url}}
+        file_meta = {"id": file_id, "name": name, "media": media}
+        if direct_url:
+            file_meta["direct_url"] = direct_url
+        return {"part": part, "file": file_meta}
+
+    async def _resolve_attachments(self, attachments: list) -> tuple[list, list]:
+        """Returns (content parts, payload files metadata) for attachment sources."""
+        parts: list = []
+        metas: list = []
+        for a in attachments:
+            res = await self.upload_attachment(a)
+            parts.append(res["part"])
+            if res.get("file"):
+                metas.append(res["file"])
+        return parts, metas
+
+    @staticmethod
+    def _with_attachment_parts(messages: list, parts: list) -> list:
+        """Append content parts to the last message (text becomes a text part)."""
+        if not messages or not parts:
+            return messages
+        out = list(messages)
+        last = dict(out[-1])
+        content = last.get("content")
+        if isinstance(content, str):
+            new_content = [{"type": "text", "text": content}] if content else []
+        elif isinstance(content, list):
+            new_content = list(content)
+        else:
+            new_content = []
+        new_content.extend(parts)
+        last["content"] = new_content
+        out[-1] = last
+        return out
+
+    def _build_request(self, messages: list, chat_id: str, model: Optional[str] = None, opts: Optional[dict] = None) -> tuple:
         """Build signed URL and payload for a chat completion request."""
+        opts = opts or {}
         timestamp = str(int(time.time() * 1000))
         request_id = str(uuid.uuid4())
-        prompt = messages[-1]["content"] if messages else ""
+        prompt = self._content_text(messages[-1]["content"]) if messages else ""
 
         sorted_payload = _build_sorted_payload(timestamp, request_id, self._user_id)
         signature = _compute_signature(sorted_payload, prompt, timestamp)
@@ -695,6 +838,29 @@ class ZaiApiClient:
         # Browser sends local wall-clock for prompt variables
         local_now = datetime.now(timezone.utc).astimezone()
         local_str = local_now.strftime("%Y-%m-%d %H:%M:%S")
+
+        web_search = bool(opts.get("web_search"))
+        advanced_search = bool(opts.get("advanced_web_search"))
+        deep_think = bool(opts.get("deep_think", True))
+        effort = opts.get("reasoning_effort") or "max"
+        if effort not in ("low", "high", "max"):
+            effort = "max"
+
+        features = {
+            "image_generation": False,
+            "web_search": advanced_search,
+            "auto_web_search": web_search or advanced_search,
+            "preview_mode": True,
+            "flags": [],
+            "vlm_tools_enable": False,
+            "vlm_web_search_enable": False,
+            "vlm_website_mode": False,
+            "enable_thinking": deep_think,
+        }
+        # FE only includes reasoning_effort while thinking is enabled
+        if deep_think:
+            features["reasoning_effort"] = effort
+
         payload = {
             "stream": True,
             "model": model or "x-preview-l",
@@ -702,18 +868,7 @@ class ZaiApiClient:
             "signature_prompt": prompt,
             "params": {},
             "extra": {},
-            "features": {
-                "image_generation": False,
-                "web_search": False,
-                "auto_web_search": False,
-                "preview_mode": True,
-                "flags": [],
-                "vlm_tools_enable": False,
-                "vlm_web_search_enable": False,
-                "vlm_website_mode": False,
-                "enable_thinking": True,
-                "reasoning_effort": "max",
-            },
+            "features": features,
             "variables": {
                 "{{USER_NAME}}": self._guest_name,
                 "{{USER_LOCATION}}": "Unknown",
@@ -734,10 +889,35 @@ class ZaiApiClient:
             },
             "captcha_verify_param": self.captcha_verify_param,
         }
+        files_meta = opts.get("files_meta")
+        if files_meta:
+            payload["files"] = files_meta
 
         return url, payload, timestamp, signature
 
-    async def _do_stream(self, messages: list, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None) -> AsyncGenerator[str, None]:
+    async def _prepare_opts(
+        self,
+        messages: list,
+        attachments: Optional[list] = None,
+        web_search: bool = False,
+        advanced_web_search: bool = False,
+        deep_think: bool = True,
+        reasoning_effort: Optional[str] = None,
+    ) -> tuple[list, dict]:
+        """Resolve attachments + build the opts dict for _build_request."""
+        opts = {
+            "web_search": bool(web_search),
+            "advanced_web_search": bool(advanced_web_search),
+            "deep_think": bool(deep_think),
+            "reasoning_effort": reasoning_effort or "max",
+        }
+        if attachments:
+            parts, metas = await self._resolve_attachments(attachments)
+            messages = self._with_attachment_parts(messages, parts)
+            opts["files_meta"] = metas
+        return messages, opts
+
+    async def _do_stream(self, messages: list, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None, opts: Optional[dict] = None) -> AsyncGenerator[str, None]:
         await self._ensure_session()
 
         if chat_id is not None:
@@ -761,10 +941,20 @@ class ZaiApiClient:
                 for m in messages:
                     role = m.get("role", "user")
                     prefix = "User" if role == "user" else "Assistant"
-                    parts.append(f"{prefix}: {m.get('content', '')}")
+                    parts.append(f"{prefix}: {self._content_text(m.get('content', ''))}")
                 parts.append("Assistant:")
-                msgs = [{"role": "user", "content": "\n".join(parts)}]
-            url, payload, ts, signature = self._build_request(msgs, self._chat_id, model=model)
+                joined = "\n".join(parts)
+                # Preserve attachment parts of the last message through the flatten
+                last_content = messages[-1].get("content")
+                attach = [
+                    p for p in last_content
+                    if isinstance(p, dict) and p.get("type") != "text"
+                ] if isinstance(last_content, list) else []
+                if attach:
+                    msgs = [{"role": "user", "content": [{"type": "text", "text": joined}] + attach}]
+                else:
+                    msgs = [{"role": "user", "content": joined}]
+            url, payload, ts, signature = self._build_request(msgs, self._chat_id, model=model, opts=opts)
             self._last_msg_id = payload["id"]
             headers = {"X-Signature": signature}
             if self.token:
@@ -848,10 +1038,26 @@ class ZaiApiClient:
 
         raise RuntimeError("Captcha refresh attempts exhausted. Run 'python3 setup.py --visible'.")
 
-    async def send_message(self, message: str, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None) -> str:
+    async def send_message(
+        self,
+        message: str,
+        timeout: int = 120,
+        chat_id: Optional[str] = None,
+        model: Optional[str] = None,
+        web_search: bool = False,
+        advanced_web_search: bool = False,
+        deep_think: bool = True,
+        reasoning_effort: Optional[str] = None,
+        attachments: Optional[list] = None,
+    ) -> str:
         self._history.append({"role": "user", "content": message})
         chunks = []
-        async for chunk in self.send_message_stream(message, timeout, chat_id=chat_id, use_history=True, model=model):
+        async for chunk in self.send_message_stream(
+            message, timeout, chat_id=chat_id, use_history=True, model=model,
+            web_search=web_search, advanced_web_search=advanced_web_search,
+            deep_think=deep_think, reasoning_effort=reasoning_effort,
+            attachments=attachments,
+        ):
             chunks.append(chunk)
         reply = "".join(chunks)
         if reply:
@@ -865,6 +1071,11 @@ class ZaiApiClient:
         chat_id: Optional[str] = None,
         use_history: bool = True,
         model: Optional[str] = None,
+        web_search: bool = False,
+        advanced_web_search: bool = False,
+        deep_think: bool = True,
+        reasoning_effort: Optional[str] = None,
+        attachments: Optional[list] = None,
     ) -> AsyncGenerator[str, None]:
         if use_history and self._history and self._history[-1] == {"role": "user", "content": message}:
             messages = list(self._history)
@@ -872,14 +1083,35 @@ class ZaiApiClient:
             messages = list(self._history) + [{"role": "user", "content": message}]
         else:
             messages = [{"role": "user", "content": message}]
-        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model):
+        messages, opts = await self._prepare_opts(
+            messages, attachments=attachments, web_search=web_search,
+            advanced_web_search=advanced_web_search, deep_think=deep_think,
+            reasoning_effort=reasoning_effort,
+        )
+        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model, opts=opts):
             yield chunk
         # caller of stream API may not append assistant; do it if stream completed
         # (send_message appends itself — detect via use_history ownership)
 
-    async def send_messages(self, messages: list, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None) -> str:
+    async def send_messages(
+        self,
+        messages: list,
+        timeout: int = 120,
+        chat_id: Optional[str] = None,
+        model: Optional[str] = None,
+        web_search: bool = False,
+        advanced_web_search: bool = False,
+        deep_think: bool = True,
+        reasoning_effort: Optional[str] = None,
+        attachments: Optional[list] = None,
+    ) -> str:
+        messages, opts = await self._prepare_opts(
+            messages, attachments=attachments, web_search=web_search,
+            advanced_web_search=advanced_web_search, deep_think=deep_think,
+            reasoning_effort=reasoning_effort,
+        )
         chunks = []
-        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model):
+        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model, opts=opts):
             chunks.append(chunk)
         reply = "".join(chunks)
         self._history = list(messages)
@@ -887,11 +1119,38 @@ class ZaiApiClient:
             self._history.append({"role": "assistant", "content": reply})
         return reply
 
-    async def send_messages_stream(self, messages: list, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None) -> AsyncGenerator[str, None]:
-        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model):
+    async def send_messages_stream(
+        self,
+        messages: list,
+        timeout: int = 120,
+        chat_id: Optional[str] = None,
+        model: Optional[str] = None,
+        web_search: bool = False,
+        advanced_web_search: bool = False,
+        deep_think: bool = True,
+        reasoning_effort: Optional[str] = None,
+        attachments: Optional[list] = None,
+    ) -> AsyncGenerator[str, None]:
+        messages, opts = await self._prepare_opts(
+            messages, attachments=attachments, web_search=web_search,
+            advanced_web_search=advanced_web_search, deep_think=deep_think,
+            reasoning_effort=reasoning_effort,
+        )
+        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model, opts=opts):
             yield chunk
 
-    async def send_message_full(self, message: str, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None) -> dict:
+    async def send_message_full(
+        self,
+        message: str,
+        timeout: int = 120,
+        chat_id: Optional[str] = None,
+        model: Optional[str] = None,
+        web_search: bool = False,
+        advanced_web_search: bool = False,
+        deep_think: bool = True,
+        reasoning_effort: Optional[str] = None,
+        attachments: Optional[list] = None,
+    ) -> dict:
         await self._ensure_session()
 
         if chat_id is not None:
@@ -900,6 +1159,12 @@ class ZaiApiClient:
 
         if self._chat_id is None:
             await self.create_conversation()
+
+        messages, opts = await self._prepare_opts(
+            [{"role": "user", "content": message}], attachments=attachments,
+            web_search=web_search, advanced_web_search=advanced_web_search,
+            deep_think=deep_think, reasoning_effort=reasoning_effort,
+        )
 
         thinking = ""
         answer = ""
@@ -910,7 +1175,7 @@ class ZaiApiClient:
             attempts += 1
             if self._chat_id is None:
                 await self.create_conversation()
-            url, payload, ts, signature = self._build_request([{"role": "user", "content": message}], self._chat_id, model=model)
+            url, payload, ts, signature = self._build_request(messages, self._chat_id, model=model, opts=opts)
             self._last_msg_id = payload["id"]
             thinking = ""
             answer = ""
