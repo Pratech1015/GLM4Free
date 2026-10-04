@@ -21,6 +21,7 @@ Async Z.ai/GLM chat stack: a pure-HTTP API client, an async Playwright browser c
 * async Playwright browser client with in-page SSE interception
 * OpenAI-compatible server (`/v1/chat/completions`, SSE) on port 3016
 * conversation continuation via `conversation_id` or `X-Session-Id`
+* system prompts (`system` role or `system_prompt` body field)
 * web search, deep think (`low`/`high`/`max`), and attachments (login)
 * guest-token auto refresh on 401
 
@@ -120,6 +121,7 @@ async def main():
     # Per-request options (same fields the server accepts)
     reply = await client.send_message(
         "Latest AI news?",
+        system_prompt="Always answer like a pirate.",
         web_search=True,              # or advanced_web_search=True
         deep_think=True,
         reasoning_effort="low",       # low | high | max
@@ -132,7 +134,7 @@ asyncio.run(main())
 ```
 
 > [!TIP]
-> `send_message_stream` also accepts `chat_id=` to pin a specific Z.ai conversation, plus the same option kwargs (`web_search`, `advanced_web_search`, `deep_think`, `reasoning_effort`, `attachments`).
+> `send_message_stream` also accepts `chat_id=` to pin a specific Z.ai conversation, plus the same option kwargs (`web_search`, `advanced_web_search`, `deep_think`, `reasoning_effort`, `attachments`, `system_prompt`).
 
 ---
 
@@ -169,7 +171,7 @@ curl -N http://127.0.0.1:3016/v1/chat/completions \
 
 Models: `glm-5.3-flash` (Z.ai), plus Gemini personalities (`boxar-1`, `yui`, `kurumi-tokisaki`, …). After `login.py`, also `glm-5.2` and `glm-5.3`.
 
-Request extras: web search, deep think / reasoning effort, and attachments — see the sections below.
+Request extras: system prompt, web search, deep think / reasoning effort, and attachments — see the sections below.
 
 ---
 
@@ -191,6 +193,31 @@ curl -N http://127.0.0.1:3016/v1/chat/completions \
 
 > [!NOTE]
 > Mappings persist to `glmpp/.zai_conversations.json` and survive restarts. List with `GET /v1/conversations`, clear with `DELETE /v1/conversations`. Always send the full `messages` history — context comes from your messages; the id only pins the same Z.ai chat.
+
+---
+
+### System Prompt
+
+Standard OpenAI `system` (or `developer`) role messages are honored:
+
+```bash
+curl -N http://127.0.0.1:3016/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"glm-5.3-flash","stream":true,"messages":[
+    {"role":"system","content":"Always answer like a pirate."},
+    {"role":"user","content":"Hello"}]}'
+```
+
+Or as a body field (handy for clients that omit system messages):
+
+```json
+{"model":"glm-5.3-flash","stream":true,"system_prompt":"Always answer like a pirate.","messages":[...]}
+```
+
+Precedence: `system_prompt` body field → `system`/`developer` messages → default model personality.
+
+> [!NOTE]
+> On the async client, pass `system_prompt=` to any `send_message*` call, or include system-role messages in a `send_messages([...])` list.
 
 ---
 

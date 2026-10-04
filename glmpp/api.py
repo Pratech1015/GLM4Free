@@ -563,7 +563,17 @@ class ZaiApiClient:
         except Exception as e:
             print(f"[captcha] pure-HTTP failed ({e}); falling back to browser", flush=True)
 
-        fresh = await type(self).setup(headless=headless, save=True)
+        fresh = None
+        last_err: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                fresh = await type(self).setup(headless=headless, save=True)
+                break
+            except Exception as e:
+                last_err = e
+                print(f"[captcha] browser fallback attempt {attempt + 1}/3 failed: {e}", flush=True)
+        if fresh is None:
+            raise RuntimeError(f"Captcha refresh failed after browser retries: {last_err}")
         self.token = fresh.token or self.token
         self.captcha_verify_param = fresh.captcha_verify_param
         self.device_id = fresh.device_id or self.device_id
@@ -814,6 +824,38 @@ class ZaiApiClient:
         out[-1] = last
         return out
 
+    @classmethod
+    def _apply_system(cls, messages: list, system_prompt: Optional[str] = None) -> list:
+        """
+        Strip system/developer role messages and prepend their text (plus an
+        explicit system_prompt kwarg) to the first message.
+        """
+        texts: list = []
+        if system_prompt:
+            texts.append(system_prompt)
+        rest: list = []
+        for m in messages or []:
+            if m.get("role") in ("system", "developer"):
+                t = cls._content_text(m.get("content", ""))
+                if t:
+                    texts.append(t)
+            else:
+                rest.append(m)
+        if not texts or not rest:
+            return rest if rest and not texts else (messages or [])
+        system_text = "\n".join(texts)
+        out = list(rest)
+        first = dict(out[0])
+        content = first.get("content")
+        if isinstance(content, str):
+            first["content"] = f"System instruction: {system_text}\n{content}"
+        elif isinstance(content, list):
+            first["content"] = [{"type": "text", "text": f"System instruction: {system_text}\n"}] + list(content)
+        else:
+            first["content"] = f"System instruction: {system_text}\n{content or ''}"
+        out[0] = first
+        return out
+
     def _build_request(self, messages: list, chat_id: str, model: Optional[str] = None, opts: Optional[dict] = None) -> tuple:
         """Build signed URL and payload for a chat completion request."""
         opts = opts or {}
@@ -917,7 +959,8 @@ class ZaiApiClient:
             opts["files_meta"] = metas
         return messages, opts
 
-    async def _do_stream(self, messages: list, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None, opts: Optional[dict] = None) -> AsyncGenerator[str, None]:
+    async def _do_stream(self, messages: list, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None, opts: Optional[dict] = None, system_prompt: Optional[str] = None) -> AsyncGenerator[str, None]:
+        messages = self._apply_system(messages, system_prompt)
         await self._ensure_session()
 
         if chat_id is not None:
@@ -1049,6 +1092,7 @@ class ZaiApiClient:
         deep_think: bool = True,
         reasoning_effort: Optional[str] = None,
         attachments: Optional[list] = None,
+        system_prompt: Optional[str] = None,
     ) -> str:
         self._history.append({"role": "user", "content": message})
         chunks = []
@@ -1056,7 +1100,7 @@ class ZaiApiClient:
             message, timeout, chat_id=chat_id, use_history=True, model=model,
             web_search=web_search, advanced_web_search=advanced_web_search,
             deep_think=deep_think, reasoning_effort=reasoning_effort,
-            attachments=attachments,
+            attachments=attachments, system_prompt=system_prompt,
         ):
             chunks.append(chunk)
         reply = "".join(chunks)
@@ -1076,6 +1120,7 @@ class ZaiApiClient:
         deep_think: bool = True,
         reasoning_effort: Optional[str] = None,
         attachments: Optional[list] = None,
+        system_prompt: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         if use_history and self._history and self._history[-1] == {"role": "user", "content": message}:
             messages = list(self._history)
@@ -1088,7 +1133,7 @@ class ZaiApiClient:
             advanced_web_search=advanced_web_search, deep_think=deep_think,
             reasoning_effort=reasoning_effort,
         )
-        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model, opts=opts):
+        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model, opts=opts, system_prompt=system_prompt):
             yield chunk
         # caller of stream API may not append assistant; do it if stream completed
         # (send_message appends itself — detect via use_history ownership)
@@ -1104,6 +1149,7 @@ class ZaiApiClient:
         deep_think: bool = True,
         reasoning_effort: Optional[str] = None,
         attachments: Optional[list] = None,
+        system_prompt: Optional[str] = None,
     ) -> str:
         messages, opts = await self._prepare_opts(
             messages, attachments=attachments, web_search=web_search,
@@ -1111,7 +1157,7 @@ class ZaiApiClient:
             reasoning_effort=reasoning_effort,
         )
         chunks = []
-        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model, opts=opts):
+        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model, opts=opts, system_prompt=system_prompt):
             chunks.append(chunk)
         reply = "".join(chunks)
         self._history = list(messages)
@@ -1130,13 +1176,14 @@ class ZaiApiClient:
         deep_think: bool = True,
         reasoning_effort: Optional[str] = None,
         attachments: Optional[list] = None,
+        system_prompt: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         messages, opts = await self._prepare_opts(
             messages, attachments=attachments, web_search=web_search,
             advanced_web_search=advanced_web_search, deep_think=deep_think,
             reasoning_effort=reasoning_effort,
         )
-        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model, opts=opts):
+        async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model, opts=opts, system_prompt=system_prompt):
             yield chunk
 
     async def send_message_full(
@@ -1150,6 +1197,7 @@ class ZaiApiClient:
         deep_think: bool = True,
         reasoning_effort: Optional[str] = None,
         attachments: Optional[list] = None,
+        system_prompt: Optional[str] = None,
     ) -> dict:
         await self._ensure_session()
 
@@ -1165,6 +1213,7 @@ class ZaiApiClient:
             web_search=web_search, advanced_web_search=advanced_web_search,
             deep_think=deep_think, reasoning_effort=reasoning_effort,
         )
+        messages = self._apply_system(messages, system_prompt)
 
         thinking = ""
         answer = ""
