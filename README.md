@@ -49,13 +49,6 @@ from glmpp.api import ZaiApiClient
 client = await ZaiApiClient.bootstrap()   # pure HTTP, saves credentials
 ```
 
-### Start The Server
-
-```bash
-cd glmpp
-python main.py
-```
-
 ### Log In (Optional — Unlocks More Models)
 
 ```bash
@@ -87,7 +80,6 @@ glmpp/
 ├── captcha.py        # pure-HTTP Aliyun captcha flow
 ├── client.py         # async Playwright browser client
 ├── login.py          # capture logged-in bearer token (unlocks glm-5.2 / glm-5.3)
-├── main.py           # OpenAI-compatible server
 ├── setup.py          # one-time browser credential extract
 ├── js/               # vendored captcha builders (Node)
 └── README.md
@@ -290,10 +282,6 @@ Pure-HTTP async client: request signing, SSE parsing, conversation creation, and
 ### 2. Captcha Layer (`captcha.py`)
 
 Browser-free Aliyun TRACELESS flow built on a known-good device identity, with the `pe.059` data builder vendored under `js/` and run in Node.
-
-### 3. Server Layer (`main.py`)
-
-aiohttp server exposing OpenAI-compatible endpoints, mapping `conversation_id` to Z.ai chat ids and flattening client history into each upstream request.
 
 ---
 
