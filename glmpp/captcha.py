@@ -175,6 +175,16 @@ def _load_device_identity() -> Optional[dict[str, str]]:
     return None
 
 
+def save_device_identity(session_key: str, core_id: str) -> None:
+    """Persist a browser-enrolled (session_key, core_id) pair so the pure-HTTP
+    solver can reuse its FeiLin binding instead of F001-ing on fresh pairs."""
+    if not session_key or not core_id:
+        return
+    path = os.path.join(os.path.dirname(__file__), ".zai_device_identity.json")
+    with open(path, "w") as f:
+        json.dump({"session_key": session_key, "core_id": core_id}, f)
+
+
 async def _build_data_field(
     certify_id: str,
     cookie: Optional[str] = None,

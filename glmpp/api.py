@@ -33,6 +33,12 @@ def _import_captcha():
         return m
 
 
+def _debug(msg: str) -> None:
+    """Diagnostic chatter - silent unless ZAI_DEBUG=1."""
+    if os.environ.get("ZAI_DEBUG"):
+        print(msg, flush=True)
+
+
 def _compute_signature(sorted_payload: str, prompt: str, timestamp: str) -> str:
     """Replicate the browser's HMAC-SHA256 signature (X-Signature header)."""
     ts_num = int(timestamp)
@@ -150,6 +156,8 @@ class ZaiApiClient:
         self._last_msg_id: Optional[str] = None
         self._history: list = []
         self._force_inline_history: bool = False
+        self._captcha_pool: list = []
+        self._prime_task = None
 
     @staticmethod
     def _parse_token(token: str) -> tuple:
@@ -212,6 +220,29 @@ class ZaiApiClient:
 
             captured = {"captcha": "", "requests": 0, "cookies": []}
 
+            async def watch_enrollment(response):
+                """Capture the browser's FeiLin DeviceConfig so the pure-HTTP
+                solver can reuse the enrolled identity (no more F001)."""
+                try:
+                    if "cloudauth" not in response.url:
+                        return
+                    body = await response.json()
+                    if not isinstance(body, dict):
+                        return
+                    cfg = (body.get("ResultObject") or {}).get("DeviceConfig")
+                    if not cfg:
+                        return
+                    captcha_mod = _import_captcha()
+                    raw = captcha_mod._aes_decrypt_b64(cfg, captcha_mod.KEY_RES).decode("utf-8").split("#")
+                    session_key = base64.b64decode(raw[0] + "=" * (-len(raw[0]) % 4)).decode("ascii")
+                    core_id = raw[2]
+                    captcha_mod.save_device_identity(session_key, core_id)
+                    _debug("[captcha] device identity re-enrolled (pure-HTTP restored)")
+                except Exception as e:
+                    _debug(f"[captcha] enrollment capture failed: {e}")
+
+            page.on("response", lambda r: asyncio.create_task(watch_enrollment(r)))
+
             async def handle_request(route):
                 request = route.request
                 if "/api/v2/chat/completions" in request.url:
@@ -238,9 +269,9 @@ class ZaiApiClient:
                             pass
                 await route.continue_()
 
-            page.on("console", lambda m: print(f"  [browser] {m.text[:300]}", flush=True)
+            page.on("console", lambda m: _debug(f"  [browser] {m.text[:300]}")
                     if ("captcha" in m.text.lower() or "error" in m.text.lower() or m.type == "error") else None)
-            page.on("pageerror", lambda e: print(f"  [pageerror] {str(e)[:160]}", flush=True))
+            page.on("pageerror", lambda e: _debug(f"  [pageerror] {str(e)[:160]}"))
 
             # Dump captcha fail payloads for diagnosis
             await page.add_init_script("""
@@ -342,17 +373,17 @@ class ZaiApiClient:
                 await asyncio.sleep(1)
                 state = f"requests={captured['requests']}"
                 if state != last_state:
-                    print(f"  [{state}]", flush=True)
+                    _debug(f"  [{state}]")
                     last_state = state
                 if captured["requests"] == 0 and time.time() - last_send > 8:
                     attempts += 1
                     last_send = time.time()
                     ok = await force_send("test")
-                    print(f"  [send attempt {attempts} -> {ok}]", flush=True)
+                    _debug(f"  [send attempt {attempts} -> {ok}]")
                     try:
                         fails = await page.evaluate("() => (window.__capfails || []).slice(-5)")
                         for f in fails:
-                            print(f"  [capfail] {f[:400]}", flush=True)
+                            _debug(f"  [capfail] {f[:400]}")
                     except Exception:
                         pass
 
@@ -505,9 +536,9 @@ class ZaiApiClient:
             self.token = token
             self.cookie = cookie
             self._user_id, self._guest_name = self._parse_token(token)
-            print(f"[api] session refreshed (guest {self._guest_name})", flush=True)
+            _debug(f"[api] session refreshed (guest {self._guest_name})")
         except Exception as e:
-            print(f"[api] pure-HTTP session refresh failed ({e}); trying browser", flush=True)
+            _debug(f"[api] pure-HTTP session refresh failed ({e}); trying browser")
             fresh = await type(self).setup(headless=headless, save=True)
             self.token = fresh.token or self.token
             self.captcha_verify_param = fresh.captcha_verify_param
@@ -519,7 +550,7 @@ class ZaiApiClient:
             captcha_mod = _import_captcha()
             self.captcha_verify_param = await captcha_mod.get_captcha_verify_param()
         except Exception as e:
-            print(f"[captcha] refresh after session failed: {e}", flush=True)
+            _debug(f"[captcha] refresh after session failed: {e}")
 
         self._chat_id = None
         self._last_msg_id = None
@@ -544,34 +575,60 @@ class ZaiApiClient:
         """
         Obtain a fresh single-use captcha.
 
-        Prefers the pure-HTTP Aliyun TRACELESS path (no browser). Falls back
-        to Firefox setup only if pure-HTTP fails (e.g. missing device identity
-        or Node data builder).
+        Pure-HTTP Aliyun TRACELESS path, retried a few times; the Firefox
+        setup flow is a last-resort fallback for environments where the
+        pure-HTTP solver is risk-blocked (users without a working solver).
         """
-        try:
-            captcha_mod = _import_captcha()
-
-            fresh_param = await captcha_mod.get_captcha_verify_param()
-            self.captcha_verify_param = fresh_param
-            # Pure-HTTP captcha does not rotate Z.ai cookies/token; keep them.
+        # a background prime may already hold valid params - wait for the
+        # first deposit rather than the whole fill loop
+        task = getattr(self, "_prime_task", None)
+        deadline = time.time() + 90
+        while (not self._captcha_pool and task is not None and not task.done()
+               and time.time() < deadline):
+            await asyncio.sleep(0.5)
+        if self._captcha_pool:
+            self.captcha_verify_param = self._captcha_pool.pop(0)
             self._chat_id = None
             self._last_msg_id = None
             self._force_inline_history = bool(self._history)
             await self.close()
             await self._ensure_session()
             return self.captcha_verify_param
-        except Exception as e:
-            print(f"[captcha] pure-HTTP failed ({e}); falling back to browser", flush=True)
+
+        last_err: Optional[Exception] = None
+        if time.time() >= getattr(self, "_f001_until", 0):
+            captcha_mod = _import_captcha()
+            for attempt in range(3):
+                try:
+                    fresh_param = await captcha_mod.get_captcha_verify_param()
+                    self.captcha_verify_param = fresh_param
+                    # Pure-HTTP captcha does not rotate Z.ai cookies/token; keep them.
+                    self._chat_id = None
+                    self._last_msg_id = None
+                    self._force_inline_history = bool(self._history)
+                    await self.close()
+                    await self._ensure_session()
+                    return self.captcha_verify_param
+                except Exception as e:
+                    last_err = e
+                    _debug(f"[captcha] pure-HTTP attempt {attempt + 1}/3 failed ({e})")
+                    if attempt < 2:
+                        await asyncio.sleep(1)
+            # Aliyun is risk-blocking this host - skip pure-HTTP for a while
+            self._f001_until = time.time() + 600
+        else:
+            _debug("[captcha] recent F001 - going straight to browser")
+
+        _debug(f"[captcha] pure-HTTP failed ({last_err}); falling back to browser")
 
         fresh = None
-        last_err: Optional[Exception] = None
         for attempt in range(3):
             try:
                 fresh = await type(self).setup(headless=headless, save=True)
                 break
             except Exception as e:
                 last_err = e
-                print(f"[captcha] browser fallback attempt {attempt + 1}/3 failed: {e}", flush=True)
+                _debug(f"[captcha] browser fallback attempt {attempt + 1}/3 failed: {e}")
         if fresh is None:
             raise RuntimeError(f"Captcha refresh failed after browser retries: {last_err}")
         self.token = fresh.token or self.token
@@ -587,6 +644,35 @@ class ZaiApiClient:
         await self.close()
         await self._ensure_session()
         return self.captcha_verify_param
+
+    def prime_captcha(self):
+        """Background-fill the single-use captcha pool so following turns
+        start instantly. Pure-HTTP first, silent headless browser otherwise."""
+        if self._prime_task is not None and not self._prime_task.done():
+            return self._prime_task
+
+        async def _run() -> None:
+            while len(self._captcha_pool) < 2:
+                param = None
+                if time.time() >= getattr(self, "_f001_until", 0):
+                    try:
+                        captcha_mod = _import_captcha()
+                        param = await captcha_mod.get_captcha_verify_param()
+                    except Exception as e:
+                        _debug(f"[captcha] background pure-HTTP prime failed: {e}")
+                if not param:
+                    try:
+                        fresh = await type(self).setup(headless=True, save=False)
+                        param = fresh.captcha_verify_param
+                        await fresh.close()
+                    except Exception as e:
+                        _debug(f"[captcha] background browser prime failed: {e}")
+                if not param:
+                    break
+                self._captcha_pool.append(param)
+                _debug(f"[captcha] primed ({len(self._captcha_pool)}/2)")
+        self._prime_task = asyncio.ensure_future(_run())
+        return self._prime_task
 
     @staticmethod
     def _is_captcha_error(text: str) -> bool:
@@ -619,7 +705,7 @@ class ZaiApiClient:
         ) as resp:
             text = await resp.text()
             if resp.status != 200 and self._is_auth_error(text, resp.status):
-                print("[api] create chat unauthorized — refreshing session...", flush=True)
+                _debug("[api] create chat unauthorized — refreshing session...")
                 await self.refresh_session()
                 headers = {}
                 if self.cookie:
@@ -959,7 +1045,7 @@ class ZaiApiClient:
             opts["files_meta"] = metas
         return messages, opts
 
-    async def _do_stream(self, messages: list, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None, opts: Optional[dict] = None, system_prompt: Optional[str] = None) -> AsyncGenerator[str, None]:
+    async def _do_stream(self, messages: list, timeout: int = 120, chat_id: Optional[str] = None, model: Optional[str] = None, opts: Optional[dict] = None, system_prompt: Optional[str] = None, include_thinking: bool = False) -> AsyncGenerator:
         messages = self._apply_system(messages, system_prompt)
         await self._ensure_session()
 
@@ -979,6 +1065,8 @@ class ZaiApiClient:
             # After a session refresh, rebuild the prompt so prior turns are
             # visible even if the server ignores message history on a new chat.
             msgs = messages
+            if self._captcha_pool:
+                self.captcha_verify_param = self._captcha_pool.pop(0)
             if self._force_inline_history and len(messages) > 1:
                 parts = []
                 for m in messages:
@@ -1019,11 +1107,11 @@ class ZaiApiClient:
                 if resp.status != 200:
                     err_body = await resp.text()
                     if self._is_auth_error(err_body, resp.status) and attempts < max_attempts:
-                        print("[api] Unauthorized — refreshing session...", flush=True)
+                        _debug("[api] Unauthorized — refreshing session...")
                         await self.refresh_session()
                         captcha_error = True
                     elif self._is_retryable_session_error(err_body) and attempts < max_attempts:
-                        print("[api] Session/captcha error — refreshing captcha...")
+                        _debug("[api] Session/captcha error — refreshing captcha...")
                         await self.refresh_captcha()
                         captcha_error = True
                     else:
@@ -1047,6 +1135,9 @@ class ZaiApiClient:
                             if not data_str or data_str == "[DONE]":
                                 if captcha_error:
                                     break
+                                # the rebuilt transcript landed on the new
+                                # chat - server context is whole again
+                                self._force_inline_history = False
                                 return
                             try:
                                 obj = json.loads(data_str)
@@ -1060,20 +1151,23 @@ class ZaiApiClient:
                                             err_code == "FRONTEND_CAPTCHA_REQUIRED"
                                             or err_code == "INTERNAL_ERROR"
                                         ) and attempts < max_attempts:
-                                            print("[api] Session/captcha error in SSE — refreshing captcha...")
+                                            _debug("[api] Session/captcha error in SSE — refreshing captcha...")
                                             captcha_error = True
                                             break
                                         raise RuntimeError(f"API error: {err}")
                                     delta = data.get("delta_content", "")
                                     phase = data.get("phase", "")
-                                    # Only stream answer text; thinking is not part of the reply.
-                                    if delta and phase != "thinking":
-                                        yield delta
+                                    if delta:
+                                        if include_thinking:
+                                            yield ("thinking" if phase == "thinking" else "answer", delta)
+                                        elif phase != "thinking":
+                                            yield delta
                             except json.JSONDecodeError:
                                 continue
                     if captcha_error:
                         await self.refresh_captcha()
                         continue
+                    self._force_inline_history = False
                     return
 
             if captcha_error:
@@ -1133,10 +1227,53 @@ class ZaiApiClient:
             advanced_web_search=advanced_web_search, deep_think=deep_think,
             reasoning_effort=reasoning_effort,
         )
+        parts = []
         async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model, opts=opts, system_prompt=system_prompt):
+            parts.append(chunk)
             yield chunk
-        # caller of stream API may not append assistant; do it if stream completed
-        # (send_message appends itself — detect via use_history ownership)
+        # stream consumed fully - keep the turn in history for follow-ups
+        self._history = list(messages)
+        reply = "".join(parts)
+        if reply:
+            self._history.append({"role": "assistant", "content": reply})
+
+    async def send_message_stream_full(
+        self,
+        message: str,
+        timeout: int = 120,
+        chat_id: Optional[str] = None,
+        use_history: bool = True,
+        model: Optional[str] = None,
+        web_search: bool = False,
+        advanced_web_search: bool = False,
+        deep_think: bool = True,
+        reasoning_effort: Optional[str] = None,
+        attachments: Optional[list] = None,
+        system_prompt: Optional[str] = None,
+    ) -> AsyncGenerator[tuple, None]:
+        """Like send_message_stream, but yields (phase, text) tuples where
+        phase is "thinking" or "answer"."""
+        if use_history and self._history and self._history[-1] == {"role": "user", "content": message}:
+            messages = list(self._history)
+        elif use_history:
+            messages = list(self._history) + [{"role": "user", "content": message}]
+        else:
+            messages = [{"role": "user", "content": message}]
+        messages, opts = await self._prepare_opts(
+            messages, attachments=attachments, web_search=web_search,
+            advanced_web_search=advanced_web_search, deep_think=deep_think,
+            reasoning_effort=reasoning_effort,
+        )
+        parts = []
+        async for item in self._do_stream(messages, timeout, chat_id=chat_id, model=model, opts=opts, system_prompt=system_prompt, include_thinking=True):
+            if item[0] == "answer":
+                parts.append(item[1])
+            yield item
+        # stream consumed fully - keep the turn in history for follow-ups
+        self._history = list(messages)
+        reply = "".join(parts)
+        if reply:
+            self._history.append({"role": "assistant", "content": reply})
 
     async def send_messages(
         self,
@@ -1183,8 +1320,14 @@ class ZaiApiClient:
             advanced_web_search=advanced_web_search, deep_think=deep_think,
             reasoning_effort=reasoning_effort,
         )
+        parts = []
         async for chunk in self._do_stream(messages, timeout, chat_id=chat_id, model=model, opts=opts, system_prompt=system_prompt):
+            parts.append(chunk)
             yield chunk
+        self._history = list(messages)
+        reply = "".join(parts)
+        if reply:
+            self._history.append({"role": "assistant", "content": reply})
 
     async def send_message_full(
         self,
@@ -1246,11 +1389,11 @@ class ZaiApiClient:
                 if resp.status != 200:
                     err_body = await resp.text()
                     if self._is_auth_error(err_body, resp.status) and attempts < max_attempts:
-                        print("[api] Unauthorized — refreshing session...", flush=True)
+                        _debug("[api] Unauthorized — refreshing session...")
                         await self.refresh_session()
                         continue
                     if self._is_captcha_error(err_body) and attempts < max_attempts:
-                        print("[api] Captcha required/expired — refreshing captcha...")
+                        _debug("[api] Captcha required/expired — refreshing captcha...")
                         await self.refresh_captcha()
                         continue
                     raise RuntimeError(f"API error {resp.status}: {err_body}")
@@ -1259,7 +1402,7 @@ class ZaiApiClient:
 
                 if "FRONTEND_CAPTCHA_REQUIRED" in text:
                     if attempts < max_attempts:
-                        print("[api] Captcha error — refreshing captcha...")
+                        _debug("[api] Captcha error — refreshing captcha...")
                         await self.refresh_captcha()
                         continue
                     raise RuntimeError("Captcha refresh attempts exhausted.")

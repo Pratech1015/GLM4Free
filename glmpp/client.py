@@ -12,7 +12,15 @@ import time
 import random
 from typing import Optional, List
 from dataclasses import dataclass
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+try:
+    from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+    _PLAYWRIGHT_MISSING = None
+except ImportError:  # browser is a fallback - pure-HTTP works without it
+    async_playwright = Page = Browser = BrowserContext = object
+    _PLAYWRIGHT_MISSING = (
+        "playwright is not installed - run `pip install playwright` and "
+        "`playwright install firefox` to use the browser fallback"
+    )
 
 # Shared with login.py — remembered browser session (cookies + localStorage)
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".zai_browser_state.json")
@@ -33,6 +41,8 @@ class ZaiClient:
         self._playwright = None
 
     async def start(self) -> None:
+        if _PLAYWRIGHT_MISSING:
+            raise RuntimeError(_PLAYWRIGHT_MISSING)
         await self.close()
         self._playwright = await async_playwright().start()
         self.browser = await self._playwright.firefox.launch(
@@ -338,51 +348,101 @@ class ZaiClient:
         await self.close()
 
 
-async def main():
-    """Interactive chat with Z.ai"""
-    client = ZaiClient(headless=True)
+async def _chat_repl(stream_fn, on_turn_done=None, system_state=None):
+    """Interactive loop. stream_fn(prompt) yields str chunks or (phase, str)
+    tuples. Returns False when a captcha failure should trigger the fallback."""
+    print("\n" + "=" * 60)
+    print("CHAT STARTED - Type 'quit' to exit")
+    print("Commands: /system <text>  (set instruction), /system off")
+    print("=" * 60)
+    while True:
+        try:
+            user_input = (await asyncio.to_thread(input, "\nYou: ")).strip()
+            if not user_input:
+                continue
+            if user_input.lower() in ('quit', 'exit', 'q'):
+                break
+            if user_input.lower().startswith("/system") and system_state is not None:
+                arg = user_input[len("/system"):].strip()
+                if not arg:
+                    print(f"System instruction: {system_state.get('text') or '(none)'}")
+                elif arg.lower() in ("off", "clear", "none"):
+                    system_state["text"] = None
+                    print("System instruction cleared.")
+                else:
+                    system_state["text"] = arg
+                    print(f"System instruction set: {arg}")
+                continue
 
+            print("Assistant:", flush=True)
+            phase = ""
+            async for item in stream_fn(user_input):
+                if isinstance(item, tuple):
+                    item_phase, delta = item
+                else:
+                    item_phase, delta = "answer", item
+                if not delta:
+                    continue
+                if item_phase != phase:
+                    if phase:
+                        print()
+                    if item_phase == "thinking":
+                        print("[thinking] ", end="", flush=True)
+                    phase = item_phase
+                print(delta, end="", flush=True)
+            print()
+            if on_turn_done is not None:
+                on_turn_done()
+
+        except KeyboardInterrupt:
+            print("\n\nGoodbye!")
+            break
+        except Exception as e:
+            print(f"\n[Error] {e}")
+            if "captcha" in str(e).lower():
+                return False
+    return True
+
+
+async def main():
+    """Interactive chat: pure-HTTP first, browser only as fallback."""
+    api = None
+    try:
+        try:
+            from .api import ZaiApiClient
+        except ImportError:
+            from glmpp.api import ZaiApiClient
+        api = ZaiApiClient.auto_init() or ZaiApiClient.from_env()
+    except Exception as e:
+        print(f"Warning: pure-HTTP client unavailable: {e}")
+
+    if api is not None:
+        print("Using pure-HTTP client (no browser needed)")
+        effort = os.environ.get("ZAI_EFFORT", "low")
+        system_state = {"text": os.environ.get("ZAI_SYSTEM") or None}
+        api.prime_captcha()  # background: next turn starts instantly
+        try:
+            done = await _chat_repl(
+                lambda m: api.send_message_stream_full(
+                    m, reasoning_effort=effort,
+                    system_prompt=system_state["text"],
+                ),
+                on_turn_done=api.prime_captcha,
+                system_state=system_state,
+            )
+        finally:
+            await api.close()
+        if done is not False:
+            return
+        print("Pure-HTTP captcha failed - falling back to browser client.")
+    else:
+        print("No GLM credentials found - starting browser client.")
+
+    client = ZaiClient(headless=True)
     try:
         await client.start()
         await client.wait_for_auth()
-
-        print("\n" + "=" * 60)
-        print("CHAT STARTED - Type 'quit' to exit")
-        print("=" * 60)
-
-        while True:
-            try:
-                user_input = (await asyncio.to_thread(input, "\nYou: ")).strip()
-                if not user_input:
-                    continue
-                if user_input.lower() in ('quit', 'exit', 'q'):
-                    break
-
-                # Live-stream the reply (and thinking, if any)
-                print("Assistant: ", end="", flush=True)
-                thinking_buf = ""
-                answer_started = False
-                async for phase, delta in client.send_message_stream_full(user_input):
-                    if not delta:
-                        continue
-                    if phase == "thinking":
-                        thinking_buf += delta
-                        print(f"\r[thinking] {thinking_buf}", end="", flush=True)
-                    else:
-                        if not answer_started:
-                            answer_started = True
-                            print(f"\r{' ' * 78}\r", end="")
-                        print(delta, end="", flush=True)
-                if thinking_buf and not answer_started:
-                    print()
-                print()
-
-            except KeyboardInterrupt:
-                print("\n\nGoodbye!")
-                break
-            except Exception as e:
-                print(f"\n[Error] {e}")
-
+        await _chat_repl(client.send_message_stream_full)
     finally:
         await client.close()
 
