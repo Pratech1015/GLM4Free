@@ -29,7 +29,12 @@ def _import_captcha():
         from glmpp import captcha as m
         return m
     except ImportError:
+        pass
+    try:
         import captcha as m
+        return m
+    except ImportError:
+        from GLM4Free.glmpp import captcha as m  # cwd-independent (gateway root)
         return m
 
 
