@@ -216,7 +216,15 @@ class ZaiApiClient:
         from playwright.async_api import async_playwright
 
         async with async_playwright() as p:
-            browser = await p.firefox.launch(headless=headless)
+            try:
+                browser = await p.firefox.launch(headless=headless)
+            except Exception as e:
+                if "ENOENT" in str(e) or "Executable doesn't exist" in str(e):
+                    raise RuntimeError(
+                        "playwright firefox is missing or broken - install once with: "
+                        "python -m playwright install firefox"
+                    ) from e
+                raise
             context = await browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 locale="en-US",
@@ -634,6 +642,8 @@ class ZaiApiClient:
             except Exception as e:
                 last_err = e
                 _debug(f"[captcha] browser fallback attempt {attempt + 1}/3 failed: {e}")
+                if "playwright firefox is missing" in str(e):
+                    break  # retries cannot help until browsers are installed
         if fresh is None:
             raise RuntimeError(f"Captcha refresh failed after browser retries: {last_err}")
         self.token = fresh.token or self.token
